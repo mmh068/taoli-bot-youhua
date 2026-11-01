@@ -133,8 +133,12 @@ pub fn meets_executable_spread(row: &Value) -> bool {
     entry > Decimal::ZERO && net > Decimal::ZERO
 }
 
-fn precheck_floor() -> Decimal {
+pub fn precheck_floor_pct() -> Decimal {
     precheck_min_net_pct().max(copied_settings().min_net_pct)
+}
+
+fn precheck_floor() -> Decimal {
+    precheck_floor_pct()
 }
 
 fn row_pct(row: &Value, field: &str) -> Option<Decimal> {
@@ -143,9 +147,8 @@ fn row_pct(row: &Value, field: &str) -> Option<Decimal> {
         .and_then(|text| text.parse::<Decimal>().ok())
 }
 
-/// 推送文案。价差和盈亏与价差提醒同一个口径：
-/// 可成交价差是吃完这笔名义后的开仓价差；回到正常的净赚 = 该价差扣掉平仓穿价和往返手续费，
-/// 再减去正常基差（正常基差按空腿减多腿）。不把持有期资金费算进这一行。
+/// 推送文案。净收益与进机会文件同一档：
+/// 一档可成交价差扣掉平仓穿价和往返手续费，再减去正常基差，加上 8 小时资金费。
 pub fn manual_push_text(
     base: &str,
     long: &str,
@@ -156,9 +159,9 @@ pub fn manual_push_text(
     normal_basis_pct: Decimal,
     basis_pct: Decimal,
     session: &str,
-    depth_net_pct: Decimal,
+    net_pct: Decimal,
 ) -> String {
-    let raw_net = depth_net_pct - normal_basis_pct;
+    let raw_net = net_pct;
     let net_pct = raw_net.round_dp(3);
     let profit_usdt = (raw_net / Decimal::ONE_HUNDRED * size)
         .round_dp(2)
@@ -166,7 +169,7 @@ pub fn manual_push_text(
     let long_label = venue_name(long);
     let short_label = venue_name(short);
     format!(
-        "手动机会已通过预检：{base} 多 {long_label} / 空 {short_label}，{} USDT × {}x\n可成交价差 {}%（{} USDT），{session}正常基差 {}%，当前 {}%（{short_label} − {long_label}）\n回到正常水平预估净赚 {}%（≈{profit_usdt} USDT，已扣手续费与平仓穿价）\n30 分钟内有效，用过即废。下单前仍按自动开仓标准重查。",
+        "手动机会已通过预检：{base} 多 {long_label} / 空 {short_label}，{} USDT × {}x\n可成交价差 {}%（{} USDT），{session}正常基差 {}%，当前 {}%（{short_label} − {long_label}）\n回到正常水平预估净赚 {}%（≈{profit_usdt} USDT，已扣手续费与平仓穿价，含 8 小时资金费）\n30 分钟内有效，用过即废。下单前仍重查，资金费固定按 8 小时，不看自动面板。",
         size.normalize(),
         leverage.normalize(),
         entry_pct.round_dp(3).normalize(),
@@ -176,6 +179,48 @@ pub fn manual_push_text(
         net_pct.normalize(),
         profit_usdt = profit_usdt,
     )
+}
+
+/// 通过预检：用当前扫描的一档净收益，和进预检的门槛比。不吃深度，也不另按面板小时数再扣一次资金费。
+pub fn manual_pass_block(
+    report: &ScanReport,
+    base: &str,
+    long: Venue,
+    short: Venue,
+    floor_pct: Decimal,
+) -> Option<String> {
+    let Some(normal) = paired_normal_basis_pct(base, long, short) else {
+        return Some("正常基差算不出来，这次不通过预检".into());
+    };
+    let Some(opportunity) = find_spread(report, base, long, short) else {
+        return Some("这轮扫描没有这对，这次不通过预检".into());
+    };
+    let Some(entry) = opportunity.executable_basis_pct else {
+        return Some("可成交价差算不出来，这次不通过预检".into());
+    };
+    if entry <= Decimal::ZERO {
+        return Some("可成交价差不为正：空腿卖出价要高于多腿买入价".into());
+    }
+    let price_net = (opportunity.spread_net * Decimal::ONE_HUNDRED).round_dp(4);
+    if price_net <= Decimal::ZERO {
+        return Some(format!(
+            "可成交价差 {}% 扣掉平仓穿价与往返手续费后不划算（净 {}%）",
+            entry.round_dp(3).normalize(),
+            price_net.round_dp(3).normalize()
+        ));
+    }
+    let funding = funding_8h_pct(opportunity).unwrap_or(Decimal::ZERO);
+    let net = quote_net_to_normal(price_net, normal, funding);
+    if net < floor_pct {
+        return Some(format!(
+            "回到正常水平预估净赚 {}% 低于门槛 {}%（一档可成交价差已扣平仓穿价与往返手续费，减去正常基差 {}%，并计入 8 小时资金费 {}%）",
+            net.round_dp(3).normalize(),
+            floor_pct.normalize(),
+            normal.round_dp(3).normalize(),
+            funding.round_dp(3).normalize()
+        ));
+    }
+    None
 }
 
 fn venue_name(name: &str) -> String {
@@ -191,6 +236,7 @@ pub struct ManualSpread {
     pub normal_basis_pct: Decimal,
     pub basis_pct: Decimal,
     pub session_label: String,
+    pub net_to_normal_pct: Decimal,
 }
 
 pub fn spread_for_push(base: &str, long: Venue, short: Venue) -> Option<ManualSpread> {
@@ -211,6 +257,7 @@ pub fn spread_for_push(base: &str, long: Venue, short: Venue) -> Option<ManualSp
                 .map(Session::label)
                 .unwrap_or("当前")
                 .to_string(),
+            net_to_normal_pct: row_pct(&row, "net_to_normal_pct")?,
         })
     })
 }
@@ -241,6 +288,16 @@ pub fn basis_store_path() -> PathBuf {
 }
 
 /// 最近一轮里某个手动机会的回到正常净收益（%）。没有或过期则为空。
+/// 最近一轮达标手动机会记下的正常基差（%，空腿减多腿）。
+pub fn paired_normal_basis_pct(base: &str, long: Venue, short: Venue) -> Option<Decimal> {
+    qualifying_manual().into_iter().find_map(|row| {
+        if !same_pair(&row, base, long, short) {
+            return None;
+        }
+        row_pct(&row, "normal_basis_pct")
+    })
+}
+
 pub fn manual_net_to_normal(base: &str, long: Venue, short: Venue) -> Option<String> {
     qualifying_manual().into_iter().find_map(|row| {
         (row["base"] == base && row["long"] == long.as_str() && row["short"] == short.as_str())
@@ -488,7 +545,7 @@ fn manual_rounds(key: &str) -> u32 {
 const MANUAL_TOP: usize = 18;
 
 /// 每个币只留机会净收益最大的那一对，再取全市场前 N 条。
-/// 有正常基差时比回到正常的净收益；没有时比价差净收益加持有期资金费。
+/// 有正常基差时比回到正常的净收益（一档价差扣费后再减正常基差，加 8 小时资金费）；没有时比价差净收益加 8 小时资金费。
 fn top_spread<'a>(
     report: &'a ScanReport,
     normals: Option<&HashMap<String, Normal>>,
@@ -519,29 +576,58 @@ fn top_spread<'a>(
 }
 
 fn selection_net(opportunity: &Opportunity, normals: Option<&HashMap<String, Normal>>) -> Decimal {
-    let funding = funding_over_hold_pct(opportunity).unwrap_or(Decimal::ZERO);
+    let funding = funding_8h_pct(opportunity).unwrap_or(Decimal::ZERO);
     let price = (opportunity.spread_net * Decimal::ONE_HUNDRED).round_dp(4);
     let Some(normals) = normals else {
         return price + funding;
     };
-    let key = format!(
-        "{}|{}|{}",
-        opportunity.symbol.base,
-        opportunity.long.as_str(),
-        opportunity.short.as_str()
+    let key = basis_key(
+        &opportunity.symbol.base,
+        opportunity.long,
+        opportunity.short,
+        session_of(),
     );
     let Some(normal) = normals.get(&key) else {
         return price + funding;
     };
-    let Some(mark) = opportunity.entry_basis_pct else {
+    let Some(normal_pct) = Decimal::from_f64_retain(normal.median) else {
         return price + funding;
     };
-    let Some(mark) = mark.to_f64() else {
-        return price + funding;
-    };
-    Decimal::try_from(mark - normal.median)
-        .map(|back| (back + funding).round_dp(4))
-        .unwrap_or(price + funding)
+    quote_net_to_normal(price, normal_pct, funding)
+}
+
+/// 一档回到正常净收益（%）：可成交价差扣掉平仓穿价和往返手续费，再减去正常基差，加上 8 小时资金费。
+fn quote_net_to_normal(price_net_pct: Decimal, normal_pct: Decimal, funding_pct: Decimal) -> Decimal {
+    (price_net_pct - normal_pct + funding_pct).round_dp(4)
+}
+
+/// 未来 8 小时资金费（%）。空腿收、多腿付，按扫描的日化费差摊到 8 小时。结算周期无效时不算。
+fn funding_8h_pct(opportunity: &Opportunity) -> Option<Decimal> {
+    if opportunity.long_interval_h == 0 || opportunity.short_interval_h == 0 {
+        return None;
+    }
+    let pct = opportunity.daily_spread * Decimal::from(8u32) / Decimal::from(24u32)
+        * Decimal::ONE_HUNDRED;
+    Some(pct.round_dp(4))
+}
+
+fn find_spread<'a>(
+    report: &'a ScanReport,
+    base: &str,
+    long: Venue,
+    short: Venue,
+) -> Option<&'a Opportunity> {
+    report.symbols.iter().find_map(|view| {
+        view.symbol
+            .base
+            .eq_ignore_ascii_case(base)
+            .then(|| {
+                view.spread
+                    .iter()
+                    .find(|opportunity| opportunity.long == long && opportunity.short == short)
+            })
+            .flatten()
+    })
 }
 
 /// 监控自己已经标成信号、但自动交易还没按面板门槛计时的一行。
@@ -654,7 +740,7 @@ fn manual_row(
     );
     let normal = normals.and_then(|map| map.get(&key));
     let price_net_pct = (opportunity.spread_net * Decimal::ONE_HUNDRED).round_dp(4);
-    let funding_pct = funding_over_hold_pct(opportunity);
+    let funding_pct = funding_8h_pct(opportunity);
     let net_pct = match funding_pct {
         Some(funding) => (price_net_pct + funding).round_dp(4),
         None => price_net_pct,
@@ -682,7 +768,7 @@ fn manual_row(
     });
     value["hold_days"] = json!(opportunity.spread_hold_days.normalize().to_string());
     if funding_pct.is_none() {
-        value["funding_note"] = json!("结算周期无效，资金费没算进净收益");
+        value["funding_note"] = json!("结算周期无效，8 小时资金费没算进净收益");
     }
     attach_normal(&mut value, normal, opportunity.entry_basis_pct);
     let min_net = min_net_pct();
@@ -828,12 +914,16 @@ fn basis_key(base: &str, long: Venue, short: Venue, session: Session) -> String 
     )
 }
 
-/// 手动机会上记下的预估净收益（%）。已经扣过手续费。
-pub fn manual_net_profit(base: &str, long: Venue, short: Venue) -> Option<Decimal> {
+/// 开仓资金费核算用的净收益（%）：回到正常净收益去掉已经计入的 8 小时资金费。
+/// 要付的资金费再和这个数比，同一笔就不会算两次。
+pub fn manual_basis_net(base: &str, long: Venue, short: Venue) -> Option<Decimal> {
     qualifying_manual().into_iter().find_map(|row| {
-        same_pair(&row, base, long, short)
-            .then(|| row_pct(&row, "net_to_normal_pct"))
-            .flatten()
+        if !same_pair(&row, base, long, short) {
+            return None;
+        }
+        let net = row_pct(&row, "net_to_normal_pct")?;
+        let funding = row_pct(&row, "funding_pct").unwrap_or(Decimal::ZERO);
+        Some(net - funding)
     })
 }
 
@@ -930,21 +1020,6 @@ fn normals_of(samples: &[BasisSample], now: DateTime<Utc>) -> HashMap<String, No
     out
 }
 
-/// 按价差持有天数估算这一笔会收付的资金费（%）。
-/// 方向与价差单相同：空腿收、多腿付。日化费差来自扫描；持有天数用机会页的「价差持有」。
-fn funding_over_hold_pct(opportunity: &Opportunity) -> Option<Decimal> {
-    if opportunity.long_interval_h == 0 || opportunity.short_interval_h == 0 {
-        return None;
-    }
-    let days = if opportunity.spread_hold_days > Decimal::ZERO {
-        opportunity.spread_hold_days
-    } else {
-        Decimal::ONE
-    };
-    let pct = opportunity.daily_spread * days * Decimal::ONE_HUNDRED;
-    Some(pct.round_dp(4))
-}
-
 fn attach_normal(value: &mut Value, normal: Option<&Normal>, mark_basis: Option<Decimal>) {
     let Some(normal) = normal else {
         value["normal_basis_pct"] = Value::Null;
@@ -958,16 +1033,21 @@ fn attach_normal(value: &mut Value, normal: Option<&Normal>, mark_basis: Option<
         json!(basis.round_dp(4).normalize().to_string())
     });
     value["normal_minutes"] = json!(normal.minutes);
-    let price = mark_basis.and_then(|basis| basis.to_f64()).map(|basis| {
-        // 标记价基差已经是（空 − 多）。回到中位数时，多出来的那一段才是能收回的。
-        basis - normal.median
-    });
     let funding = value["funding_pct"]
         .as_str()
-        .and_then(|text| text.parse::<f64>().ok());
-    value["net_to_normal_pct"] = match (price, funding) {
-        (Some(price), Some(funding)) => json!(format!("{:.4}", price + funding)),
-        (Some(price), None) => json!(format!("{price:.4}")),
+        .and_then(|text| text.parse::<Decimal>().ok())
+        .unwrap_or(Decimal::ZERO);
+    let price_net = value["price_net_pct"]
+        .as_str()
+        .and_then(|text| text.parse::<Decimal>().ok());
+    let normal_pct = Decimal::from_f64_retain(normal.median);
+    value["net_to_normal_pct"] = match (price_net, normal_pct) {
+        (Some(price), Some(normal_pct)) => {
+            json!(format!(
+                "{:.4}",
+                quote_net_to_normal(price, normal_pct, funding)
+            ))
+        }
         _ => Value::Null,
     };
 }
@@ -1236,16 +1316,26 @@ mod tests {
             dec!(-0.072),
             dec!(0.222),
             "周末",
-            dec!(0.055),
+            dec!(0.127),
         );
         assert!(
             text.contains("可成交价差 0.184%（300 USDT），周末正常基差 -0.072%，当前 0.222%（Arcus − Lighter RH）"),
             "{text}"
         );
         assert!(
-            text.contains("回到正常水平预估净赚 0.127%（≈0.38 USDT，已扣手续费与平仓穿价）"),
+            text.contains("回到正常水平预估净赚 0.127%（≈0.38 USDT，已扣手续费与平仓穿价，含 8 小时资金费）"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn manual_precheck_rejects_a_negative_return_to_normal() {
+        use rust_decimal_macros::dec;
+        let net = super::quote_net_to_normal(dec!(0.299), dec!(0.697), dec!(0));
+        assert!(net < dec!(0.05));
+        assert_eq!(net, dec!(-0.398));
+        let cleared = super::quote_net_to_normal(dec!(0.055), dec!(-0.072), dec!(0));
+        assert!(cleared >= dec!(0.05));
     }
 
     use super::*;
@@ -1299,7 +1389,7 @@ mod tests {
 
     #[test]
     fn precheck_uses_its_own_floor_and_records_the_usdt_amount() {
-        let opportunity = opportunity(dec!(0.4), dec!(0.002), false);
+        let opportunity = opportunity(dec!(1.0), dec!(0.01), false);
         let normal = Normal {
             session: session_of(),
             median: 0.2,
@@ -1320,6 +1410,8 @@ mod tests {
         );
         let row = manual_row(Utc::now(), &opportunity, Some(&normals)).unwrap();
         let net: Decimal = row["net_to_normal_pct"].as_str().unwrap().parse().unwrap();
+        // 一档净价差 1.0% − 正常基差 0.2%。测试里的资金费是 0。
+        assert_eq!(net, dec!(0.8));
         assert!(net >= min_net_pct());
         assert_eq!(
             meets_precheck(&row),
@@ -1345,6 +1437,63 @@ mod tests {
         flat["entry_pct"] = json!("0.4000");
         flat["price_net_pct"] = json!("0");
         assert!(!meets_precheck(&flat));
+    }
+
+    #[test]
+    fn manual_row_drops_when_the_one_tick_net_misses_the_floor() {
+        let opportunity = opportunity(dec!(0.4), dec!(0.002), false);
+        let normal = Normal {
+            session: session_of(),
+            median: 0.2,
+            p10: 0.1,
+            p90: 0.3,
+            mad: 0.05,
+            minutes: MIN_MINUTES,
+        };
+        let mut normals = HashMap::new();
+        normals.insert(
+            basis_key(
+                &opportunity.symbol.base,
+                opportunity.long,
+                opportunity.short,
+                session_of(),
+            ),
+            normal,
+        );
+        assert!(
+            manual_row(Utc::now(), &opportunity, Some(&normals)).is_none(),
+            "一档净价差 0.20% 减去正常基差 0.20% 后不够门槛，不进机会文件"
+        );
+    }
+
+    #[test]
+    fn manual_row_adds_eight_hour_funding() {
+        let mut opportunity = opportunity(dec!(0.4), dec!(0.002), false);
+        opportunity.daily_spread = dec!(0.01);
+        let normal = Normal {
+            session: session_of(),
+            median: 0.2,
+            p10: 0.1,
+            p90: 0.3,
+            mad: 0.05,
+            minutes: MIN_MINUTES,
+        };
+        let mut normals = HashMap::new();
+        normals.insert(
+            basis_key(
+                &opportunity.symbol.base,
+                opportunity.long,
+                opportunity.short,
+                session_of(),
+            ),
+            normal,
+        );
+        let row = manual_row(Utc::now(), &opportunity, Some(&normals)).unwrap();
+        let funding: Decimal = row["funding_pct"].as_str().unwrap().parse().unwrap();
+        let expected_funding = (dec!(0.01) * dec!(8) / dec!(24) * dec!(100)).round_dp(4);
+        assert_eq!(funding, expected_funding);
+        let net: Decimal = row["net_to_normal_pct"].as_str().unwrap().parse().unwrap();
+        assert_eq!(net, (dec!(0.2) - dec!(0.2) + expected_funding).round_dp(4));
     }
 
     #[test]
@@ -1431,7 +1580,7 @@ mod tests {
             symbols: vec![view_of(opportunity_named(
                 "FLOW",
                 dec!(2.0),
-                dec!(0.002),
+                dec!(0.01),
                 false,
             ))],
             unverified: Vec::new(),

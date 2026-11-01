@@ -245,25 +245,17 @@ async fn main() -> anyhow::Result<()> {
                 else {
                     continue;
                 };
-                let Some(depth_net) = state.precheck.passed_depth_net(&key) else {
-                    continue;
-                };
-                let depth_net_pct = (depth_net * Decimal::ONE_HUNDRED).round_dp(4);
-                let entry_pct = state
-                    .precheck
-                    .passed_depth_basis_pct(&key)
-                    .unwrap_or(spread.entry_pct);
                 let text = opportunity_log::manual_push_text(
                     base,
                     key.long.as_str(),
                     key.short.as_str(),
                     key.size,
                     key.leverage,
-                    entry_pct,
+                    spread.entry_pct,
                     spread.normal_basis_pct,
                     spread.basis_pct,
                     &spread.session_label,
-                    depth_net_pct,
+                    spread.net_to_normal_pct,
                 );
                 let telegram_sent = telegram::push_open_button(&text, &code).await;
                 let discord_sent = state.alerts.notify_discord(text);
@@ -860,16 +852,16 @@ async fn open_manual_signal(state: &Arc<AppState>, code: &str) -> Result<String,
     } else {
         None
     };
-    if let Some(hours) = settings.funding_check_hours {
-        let profit = opportunity_log::manual_net_profit(&base, long, short)
-            .ok_or("这组机会没有预估净收益，不能按资金费核算开仓")?;
-        let report = state
-            .cache
-            .get()
-            .await
-            .map(|snapshot| snapshot.report.clone());
-        rh_auto::ensure_funding_allows(report.as_ref(), &base, long, short, hours, profit)?;
-    }
+    // 手动开仓的资金费固定看未来 8 小时，不读自动面板上的 1 / 4 / 8 小时。
+    // 净收益里已经加过这笔资金费，这里去掉后再比，避免要付的钱算两次。
+    let profit = opportunity_log::manual_basis_net(&base, long, short)
+        .ok_or("这组机会没有预估净收益，不能按 8 小时资金费核算开仓")?;
+    let report = state
+        .cache
+        .get()
+        .await
+        .map(|snapshot| snapshot.report.clone());
+    rh_auto::ensure_funding_allows(report.as_ref(), &base, long, short, 8, profit)?;
     {
         let mut guard = state
             .manual_signal

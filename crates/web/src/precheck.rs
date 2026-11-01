@@ -179,6 +179,7 @@ struct Verdict {
     /// 通过时（价差单）吃完深度后收敛到 0 的净收益（小数）：展示时拿它比收敛目标。
     spread_depth_net: Option<Decimal>,
     /// 通过时吃完深度后的开仓可成交价差（%）。
+    #[allow(dead_code)]
     spread_depth_basis_pct: Option<Decimal>,
     /// 最近一次重查没做成的原因（结论仍是上一次的）。
     retry_error: Option<String>,
@@ -532,6 +533,8 @@ impl Inner {
 struct Job {
     key: VerdictKey,
     symbol: Symbol,
+    /// 手动机会。通过前要按自动开仓的价差规则再核对一遍。
+    manual: bool,
 }
 
 fn manual_row_key(symbol: &str, long: Venue, short: Venue) -> String {
@@ -569,7 +572,11 @@ fn manual_job(inner: &Inner, now: Instant) -> Option<Job> {
             .get(&key)
             .is_none_or(|verdict| verdict.due(now, tier, idle));
         if due {
-            return Some(Job { key, symbol });
+            return Some(Job {
+                key,
+                symbol,
+                manual: true,
+            });
         }
     }
     None
@@ -694,26 +701,6 @@ impl Prechecker {
         self.inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// 这条手动预检如果已经通过，返回吃完深度后的净价差（小数）。没通过或不是价差单则为空。
-    pub fn passed_depth_net(&self, key: &VerdictKey) -> Option<Decimal> {
-        let inner = self.lock();
-        let verdict = inner.verdicts.get(key)?;
-        if verdict.status != Status::Pass {
-            return None;
-        }
-        verdict.spread_depth_net.filter(|net| *net > Decimal::ZERO)
-    }
-
-    /// 这条手动预检如果已经通过，返回吃完深度后的开仓可成交价差（%）。
-    pub fn passed_depth_basis_pct(&self, key: &VerdictKey) -> Option<Decimal> {
-        let inner = self.lock();
-        let verdict = inner.verdicts.get(key)?;
-        if verdict.status != Status::Pass {
-            return None;
-        }
-        verdict.spread_depth_basis_pct
     }
 
     /// 有连续两轮达标的手动机会时，用记下的自动交易设置预检。不需要浏览器开着策略页。
@@ -1179,6 +1166,7 @@ impl Prechecker {
                 return Some(Job {
                     key: verdict_key.clone(),
                     symbol: row.symbol.clone(),
+                    manual: false,
                 });
             }
         }
@@ -1226,7 +1214,15 @@ impl Prechecker {
                 liq_distance_pct = prepared.risk.liq_distance_pct;
                 spread_depth_net = prepared.spread.as_ref().map(|edge| edge.depth_net);
                 spread_depth_basis_pct = prepared.spread.as_ref().map(|edge| edge.depth_basis_pct);
-                (Status::Pass, pass_note(&prepared))
+                if let Some(reason) = job
+                    .manual
+                    .then(|| manual_auto_rule_block(report, job, prepared.spread.as_ref()))
+                    .flatten()
+                {
+                    (Status::Blocked, reason)
+                } else {
+                    (Status::Pass, pass_note(&prepared))
+                }
             }
         };
         let now = Instant::now();
@@ -1241,6 +1237,25 @@ impl Prechecker {
             retry_error: None,
         }
     }
+}
+
+/// 手动机会在盘口预览通过之后，再按一档净收益和预检门槛决定能不能标成通过。
+fn manual_auto_rule_block(
+    report: &ScanReport,
+    job: &Job,
+    edge: Option<&desk::SpreadEdge>,
+) -> Option<String> {
+    let Some(edge) = edge else {
+        return Some("手动预检只接受价差单".into());
+    };
+    let _ = edge;
+    crate::opportunity_log::manual_pass_block(
+        report,
+        &job.symbol.base,
+        job.key.long,
+        job.key.short,
+        crate::opportunity_log::precheck_floor_pct(),
+    )
 }
 
 /// 通过时给一句话：按什么价、多少成本通过的。
