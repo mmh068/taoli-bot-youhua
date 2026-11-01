@@ -289,6 +289,7 @@ fn rows_beyond_the_priority_tier_are_rechecked_less_often() {
         attempted_at: checked,
         liq_distance_pct: None,
         spread_depth_net: None,
+        spread_depth_basis_pct: None,
         retry_error: None,
     };
     // 两分半前查过、通过：通过的 90 秒就重查，列出来的要新鲜。
@@ -334,6 +335,7 @@ fn a_pass_that_has_not_been_rechecked_for_long_is_not_shown_as_orderable() {
             attempted_at: old,
             liq_distance_pct: Some(dec!(30)),
             spread_depth_net: None,
+            spread_depth_basis_pct: None,
             retry_error: None,
         },
     );
@@ -371,6 +373,7 @@ async fn a_failed_recheck_keeps_the_previous_verdict() {
             attempted_at: now,
             liq_distance_pct: None,
             spread_depth_net: None,
+            spread_depth_basis_pct: None,
             retry_error: None,
         },
     );
@@ -563,6 +566,7 @@ async fn unchecked_rows_come_before_rechecks() {
         attempted_at: now - Duration::from_secs(age),
         liq_distance_pct: Some(dec!(30)),
         spread_depth_net: None,
+        spread_depth_basis_pct: None,
         retry_error: None,
     };
     let row = |base: &str| {
@@ -674,6 +678,7 @@ fn remembered_parameters_are_not_checked_while_nobody_is_looking() {
         attempted_at: now - Duration::from_secs(150),
         liq_distance_pct: None,
         spread_depth_net: None,
+        spread_depth_basis_pct: None,
         retry_error: None,
     };
     assert!(verdict.due(now, Tier::Priority, false));

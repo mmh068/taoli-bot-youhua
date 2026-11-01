@@ -730,6 +730,34 @@ impl AutoTrader {
         self.save(&inner.persisted);
     }
 
+    /// 执行中断被关掉之后，待核实名单已空且最近一次对账干净时，自己重新打开。
+    /// 连续回滚、请求被拒、设置读不懂这些原因不在这里打开。
+    pub async fn resume_after_unknown_execution(&self, account_clear: bool) -> bool {
+        if !account_clear {
+            return false;
+        }
+        let mut inner = self.inner.lock().await;
+        let unknown = inner
+            .persisted
+            .disabled_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("执行中断、结果未知"));
+        if !unknown || inner.persisted.settings.enabled {
+            return false;
+        }
+        inner.persisted.settings.enabled = true;
+        inner.persisted.disabled_reason = None;
+        inner.retry_at = None;
+        Self::push(
+            &mut inner,
+            "enabled",
+            None,
+            "没有待核实仓位，对账干净，自动交易已重新开启".into(),
+        );
+        self.save(&inner.persisted);
+        true
+    }
+
     /// 新设置。返回保存后的设置；启用实盘需要 `confirm_live`。
     pub async fn update(
         &self,
@@ -820,12 +848,25 @@ impl AutoTrader {
         let settings = {
             let mut inner = self.inner.lock().await;
             if !inner.persisted.settings.enabled {
+                let unknown = inner
+                    .persisted
+                    .disabled_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("执行中断、结果未知"));
                 inner.status = match &inner.persisted.disabled_reason {
                     Some(reason) => format!("已关闭：{reason}"),
                     None => "未开启".into(),
                 };
                 drop(inner);
-                // 关着时只排队记录，不在这条每秒检查里写文件。
+                if unknown
+                    && state.trade.live_reconcile_clear().await
+                    && self.resume_after_unknown_execution(true).await
+                {
+                    state
+                        .alerts
+                        .notify_always("▶️ 价差自动交易已重新开启：没有待核实仓位，对账干净。");
+                }
+                // 这一轮仍按关闭收尾。刚打开的话，下一轮再按开启继续。
                 let view = state.rh_spread.view().await;
                 tokio::spawn(async move { record_monitor_signals(&view) });
                 return;
@@ -1232,7 +1273,7 @@ impl AutoTrader {
                 error!(symbol = %candidate.base, "价差自动交易：{text}");
                 self.disable(text.clone()).await;
                 state.alerts.notify_always(format!(
-                    "⛔ 价差自动交易已关闭：{text}。以台账与对账为准，去持仓页核对后再决定是否重新开启。"
+                    "⛔ 价差自动交易已关闭：{text}。没有待核实仓位且对账干净后会自己重新开启。"
                 ));
             }
             Outcome::Misconfigured => {
@@ -1850,6 +1891,16 @@ mod tests {
             let snapshot = auto.snapshot(Some(&[])).await;
             assert_eq!(snapshot["settings"]["enabled"], json!(false));
             assert_eq!(snapshot["disabled_reason"], json!("测试"));
+            assert!(
+                !auto.resume_after_unknown_execution(true).await,
+                "别的关闭原因不能因为对账干净就打开"
+            );
+            assert!(!auto.settings().await.enabled);
+            auto.disable("执行中断、结果未知：查单失败".into()).await;
+            assert!(!auto.resume_after_unknown_execution(false).await);
+            assert!(auto.resume_after_unknown_execution(true).await);
+            assert!(auto.settings().await.enabled);
+            assert!(auto.disabled_reason().await.is_none());
         });
     }
 

@@ -1208,47 +1208,42 @@ impl LiveDesk {
 
     /// 手动核实之后补记不完整仓位。
     ///
-    /// 开仓中断且订单已有成交、账户该合约已归零的，按人工外部处理结束并核算盈亏。
+    /// 开仓中断、订单已有成交、台账没记下腿的：到这笔订单对应的交易所查持仓。
+    /// 还有仓就按交易所的净持仓把腿补上；相关场所都已归零、也没有挂单，才按人工外部处理结束并核算盈亏。
     /// 已结束但没有盈亏来源的，按订单终态能确定的情况补上；对不上或订单还没终态的只说明。
     async fn backfill_incomplete_on_verify(
         &self,
         only: &std::collections::BTreeSet<String>,
     ) -> anyhow::Result<Vec<String>> {
         let mut lines = self.finish_rejected_zero_fills(only).await?;
-        let reconciliation = self.reconcile().await?;
+        // 先对一次账，待核实名单按最新敞口更新。补腿再按这笔自己的场所现查持仓。
+        let _reconciliation = self.reconcile().await?;
         let (replayed, _) = self.ledger.replay().await?;
         let _ = arb_exec::verify_queue::refresh(self.ledger.path(), &replayed, only);
         let exposed = replayed.exposed();
-        let mut filled_openings = desk::opening_ids_with_unrecorded_fills(&replayed);
-        filled_openings.retain(|id| only.contains(id));
+        let filled_openings: Vec<String> = desk::opening_ids_with_unrecorded_fills(&replayed)
+            .into_iter()
+            .filter(|id| only.contains(id))
+            .collect();
         if filled_openings.is_empty() {
             lines.extend(self.backfill_unsettled_ended(only).await?);
             return Ok(lines);
         }
-        let mut seen = std::collections::HashMap::new();
-        let first = Instant::now()
-            .checked_sub(desk::EXTERNAL_CLOSE_CONFIRM)
-            .unwrap_or_else(Instant::now);
+        let mut adopt = Vec::new();
         for id in &filled_openings {
-            seen.insert(id.clone(), first);
-        }
-        let check = desk::check_external_closes_with(
-            &reconciliation,
-            &exposed,
-            &mut seen,
-            Instant::now(),
-            &filled_openings,
-        );
-        for note in &check.notes {
-            if filled_openings.contains(&note.position_id) {
-                lines.push(format!("[{}] {}", note.position_id, note.message));
+            let Some(position) = replayed.positions.get(id) else {
+                continue;
+            };
+            match desk::restore_opening_from_venues(&self.ledger, &self.brokers, position).await? {
+                desk::OpeningRestore::Restored(restored) => lines.push(format!(
+                    "[{}] {}",
+                    restored.id,
+                    restored.note.as_deref().unwrap_or("已按交易所持仓补记")
+                )),
+                desk::OpeningRestore::Flat => adopt.push(id.clone()),
+                desk::OpeningRestore::Held(reason) => lines.push(format!("[{id}] {reason}")),
             }
         }
-        let adopt: Vec<String> = check
-            .adopt
-            .into_iter()
-            .filter(|id| filled_openings.contains(id))
-            .collect();
         if adopt.is_empty() {
             lines.extend(self.backfill_unsettled_ended(only).await?);
             return Ok(lines);
@@ -1342,9 +1337,25 @@ impl LiveDesk {
             Err(error) => return format!("待核实名单读不了：{error}"),
         };
         if ids.is_empty() {
-            let tail = self.auto_open_after_verify().await;
-            return format!("没有需要手动核实的仓位。{tail}");
+            // 对账会把「开仓中断、没记下腿」收进名单。同一次核实就处理，不用再点一次。
+            if let Err(error) = self.reconcile().await {
+                return format!("手动核实失败：{error:#}");
+            }
+            let ids = match arb_exec::verify_queue::position_ids(&path) {
+                Ok(ids) => ids,
+                Err(error) => return format!("待核实名单读不了：{error}"),
+            };
+            if ids.is_empty() {
+                let tail = self.auto_open_after_verify().await;
+                return format!("没有需要手动核实的仓位。{tail}");
+            }
+            return self.verify_ids(ids).await;
         }
+        self.verify_ids(ids).await
+    }
+
+    /// 名单里这些仓位：先对未完成订单，再按交易所持仓补记或按外部平仓结束。
+    async fn verify_ids(&self, ids: std::collections::BTreeSet<String>) -> String {
         match desk::resolve_pending_orders_for(&self.ledger, &self.brokers, &ids).await {
             Ok(resolution) => {
                 if !resolution.filled_unrecorded.is_empty() {
@@ -1745,6 +1756,33 @@ impl Trade {
     pub(crate) fn live_can_trade(&self) -> bool {
         self.live_opt()
             .is_some_and(|live| live.mode == LiveMode::Trade)
+    }
+
+    /// 执行中断后能不能自己恢复自动交易：实盘可下单，待核实名单是空的，
+    /// 最近一次对账已经做成并且没有不一致，台账里也没有没记下腿的开仓。
+    /// 还没对过账不算干净。
+    pub(crate) async fn live_reconcile_clear(&self) -> bool {
+        if !self.live_can_trade() {
+            return false;
+        }
+        let Some(live) = self.live_opt() else {
+            return false;
+        };
+        let Ok(ids) = arb_exec::verify_queue::position_ids(live.ledger.path()) else {
+            return false;
+        };
+        if !ids.is_empty() {
+            return false;
+        }
+        let mark = live.last_reconcile.read().await;
+        if !matches!(mark.as_ref(), Some(mark) if mark.outcome == Ok(0)) {
+            return false;
+        }
+        // 名单可能还没刷新。台账里仍有没记下腿的开仓，就不能自己打开。
+        let Ok((replayed, _)) = live.ledger.replay().await else {
+            return false;
+        };
+        desk::opening_ids_with_unrecorded_fills(&replayed).is_empty()
     }
 
     /// 纸面规则轮间隔（0 = 看板不跑纸面规则）。

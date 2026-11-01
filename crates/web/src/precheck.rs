@@ -178,6 +178,8 @@ struct Verdict {
     liq_distance_pct: Option<Decimal>,
     /// 通过时（价差单）吃完深度后收敛到 0 的净收益（小数）：展示时拿它比收敛目标。
     spread_depth_net: Option<Decimal>,
+    /// 通过时吃完深度后的开仓可成交价差（%）。
+    spread_depth_basis_pct: Option<Decimal>,
     /// 最近一次重查没做成的原因（结论仍是上一次的）。
     retry_error: Option<String>,
 }
@@ -704,6 +706,16 @@ impl Prechecker {
         verdict.spread_depth_net.filter(|net| *net > Decimal::ZERO)
     }
 
+    /// 这条手动预检如果已经通过，返回吃完深度后的开仓可成交价差（%）。
+    pub fn passed_depth_basis_pct(&self, key: &VerdictKey) -> Option<Decimal> {
+        let inner = self.lock();
+        let verdict = inner.verdicts.get(key)?;
+        if verdict.status != Status::Pass {
+            return None;
+        }
+        verdict.spread_depth_basis_pct
+    }
+
     /// 有连续两轮达标的手动机会时，用记下的自动交易设置预检。不需要浏览器开着策略页。
     pub fn arm_manual_from_log(&self) {
         if !crate::opportunity_log::enabled() {
@@ -1199,7 +1211,8 @@ impl Prechecker {
             desk::prepare(report, &self.by_venue, &request, 0, limits, policy),
         )
         .await;
-        let (mut liq_distance_pct, mut spread_depth_net) = (None, None);
+        let (mut liq_distance_pct, mut spread_depth_net, mut spread_depth_basis_pct) =
+            (None, None, None);
         let (status, reason) = match outcome {
             Err(_) => (
                 Status::Unknown,
@@ -1212,6 +1225,7 @@ impl Prechecker {
             Ok(Ok(prepared)) => {
                 liq_distance_pct = prepared.risk.liq_distance_pct;
                 spread_depth_net = prepared.spread.as_ref().map(|edge| edge.depth_net);
+                spread_depth_basis_pct = prepared.spread.as_ref().map(|edge| edge.depth_basis_pct);
                 (Status::Pass, pass_note(&prepared))
             }
         };
@@ -1223,6 +1237,7 @@ impl Prechecker {
             attempted_at: now,
             liq_distance_pct,
             spread_depth_net,
+            spread_depth_basis_pct,
             retry_error: None,
         }
     }

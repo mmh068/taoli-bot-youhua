@@ -245,22 +245,24 @@ async fn main() -> anyhow::Result<()> {
                 else {
                     continue;
                 };
-                let depth_net_pct = state
-                    .precheck
-                    .passed_depth_net(&key)
-                    .map(|net| (net * Decimal::ONE_HUNDRED).round_dp(4).normalize());
-                if depth_net_pct.is_none() {
+                let Some(depth_net) = state.precheck.passed_depth_net(&key) else {
                     continue;
-                }
+                };
+                let depth_net_pct = (depth_net * Decimal::ONE_HUNDRED).round_dp(4);
+                let entry_pct = state
+                    .precheck
+                    .passed_depth_basis_pct(&key)
+                    .unwrap_or(spread.entry_pct);
                 let text = opportunity_log::manual_push_text(
                     base,
                     key.long.as_str(),
                     key.short.as_str(),
                     key.size,
                     key.leverage,
-                    spread.entry_pct,
-                    spread.price_net_pct,
-                    spread.net_to_normal_pct,
+                    entry_pct,
+                    spread.normal_basis_pct,
+                    spread.basis_pct,
+                    &spread.session_label,
                     depth_net_pct,
                 );
                 let telegram_sent = telegram::push_open_button(&text, &code).await;

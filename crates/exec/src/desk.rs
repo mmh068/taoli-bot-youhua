@@ -876,6 +876,20 @@ fn orders_have_fills(replayed: &Replayed, position: &PairPosition) -> bool {
     })
 }
 
+/// 这笔仓位还挂在场上的订单。没成交也算：第二腿还挂着时不能当成已经结束。
+fn live_orders_of<'a>(replayed: &'a Replayed, position: &PairPosition) -> Vec<&'a OrderState> {
+    let prefix = position_order_prefix(&position.id);
+    replayed
+        .orders
+        .values()
+        .filter(|order| {
+            order.order.client_order_id.0.starts_with(&prefix)
+                && order.order.symbol == position.symbol
+                && order.status.is_live()
+        })
+        .collect()
+}
+
 /// 按这笔仓位的开仓成交单重建腿：同一场所同一方向多张单合成一条。
 fn filled_open_legs(replayed: &Replayed, position: &PairPosition) -> Vec<crate::LegFill> {
     let prefix = position_order_prefix(&position.id);
@@ -917,6 +931,333 @@ fn filled_open_legs(replayed: &Replayed, position: &PairPosition) -> Vec<crate::
         }
     }
     legs
+}
+
+/// 手动核实补记开仓中断仓位的结果。不下单、不撤单。
+#[derive(Debug)]
+pub enum OpeningRestore {
+    /// 已按交易所当前净持仓把腿写进台账。仓位仍有敞口。
+    Restored(PairPosition),
+    /// 这笔订单对应的场所上，这个合约已经没有仓，也没有挂单。
+    Flat,
+    /// 这次不能写。台账保持原样。
+    Held(String),
+}
+
+/// 开仓中断、台账没记下腿、但订单有成交时，按这笔订单对应的交易所持仓补记。
+///
+/// 只查订单成交过的场所，不扫整本账户来猜测。净持仓和订单成交对得上就用订单的价格、
+/// 手续费；对不上就按交易所的数量改，价格仍优先用交易所均价。没成交但还挂着的那一腿
+/// 也要查：那边还有仓或这张单还在，整笔保持不动。成交过的场所和这些未成交的场所都
+/// 归零、也没有挂单时，返回 [`OpeningRestore::Flat`]，由调用方按人工外部处理结束。
+/// 查询失败、方向相反、或同一笔收不进两条腿时不写。
+pub async fn restore_opening_from_venues(
+    ledger: &Ledger,
+    brokers: &HashMap<Venue, Arc<dyn Broker>>,
+    position: &PairPosition,
+) -> Result<OpeningRestore> {
+    if position.status != PositionStatus::Opening
+        || position.long.is_some()
+        || position.short.is_some()
+    {
+        return Ok(OpeningRestore::Held(
+            "这笔不是没记下腿的开仓，没有按交易所持仓补记".into(),
+        ));
+    }
+    let (replayed, _) = ledger.replay().await?;
+    let mut order_legs = filled_open_legs(&replayed, position);
+    order_legs.sort_by_key(|leg| (leg.venue.as_str(), matches!(leg.side, Side::Sell)));
+    if order_legs.is_empty() {
+        return Ok(OpeningRestore::Held(
+            "订单有成交，但没有能对照的开仓成交，没有补记".into(),
+        ));
+    }
+    if order_legs
+        .iter()
+        .filter(|leg| leg.side == Side::Buy)
+        .count()
+        > 1
+        || order_legs
+            .iter()
+            .filter(|leg| leg.side == Side::Sell)
+            .count()
+            > 1
+    {
+        return Ok(OpeningRestore::Held(
+            "同一方向有多条成交腿，收不进一笔仓位，没有补记".into(),
+        ));
+    }
+    let mut venues: Vec<Venue> = order_legs.iter().map(|leg| leg.venue).collect();
+    venues.sort_by_key(|venue| venue.as_str());
+    venues.dedup();
+    let live_orders = live_orders_of(&replayed, position);
+    let filled_venues: std::collections::HashSet<Venue> =
+        order_legs.iter().map(|leg| leg.venue).collect();
+    for order in &live_orders {
+        if !venues.contains(&order.order.venue) {
+            venues.push(order.order.venue);
+        }
+    }
+    venues.sort_by_key(|venue| venue.as_str());
+    venues.dedup();
+    for other in replayed.positions.values() {
+        if other.id == position.id
+            || other.symbol != position.symbol
+            || !other.status.has_exposure()
+        {
+            continue;
+        }
+        let overlaps = [other.long.as_ref(), other.short.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(|leg| leg.venue)
+            .chain(
+                filled_open_legs(&replayed, other)
+                    .into_iter()
+                    .map(|leg| leg.venue),
+            )
+            .any(|venue| venues.contains(&venue));
+        if overlaps {
+            return Ok(OpeningRestore::Held(format!(
+                "这个合约在 {} 上已经和仓位 {} 牵在一起，不能把场所净持仓再记到这笔",
+                venues
+                    .iter()
+                    .map(|venue| venue.to_string())
+                    .collect::<Vec<_>>()
+                    .join("、"),
+                other.id
+            )));
+        }
+    }
+
+    let mut books = HashMap::new();
+    for venue in &venues {
+        let Some(broker) = brokers.get(venue) else {
+            return Ok(OpeningRestore::Held(format!(
+                "{venue} 没有连接，查不到持仓，没有补记"
+            )));
+        };
+        let rows = match broker.positions().await {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Ok(OpeningRestore::Held(format!(
+                    "{venue} 的持仓没查成：{error}，没有补记"
+                )));
+            }
+        };
+        let open = match broker.open_orders().await {
+            Ok(rows) => rows,
+            Err(error) => {
+                return Ok(OpeningRestore::Held(format!(
+                    "{venue} 的挂单没查成：{error}，没有补记"
+                )));
+            }
+        };
+        let mut net = Decimal::ZERO;
+        let mut weighted = Decimal::ZERO;
+        let mut weight = Decimal::ZERO;
+        for row in rows.into_iter().filter(|row| row.symbol == position.symbol) {
+            net += row.net_quantity;
+            if let Some(price) = row.average_price.filter(|price| *price > Decimal::ZERO) {
+                let size = row.net_quantity.abs();
+                weighted += price * size;
+                weight += size;
+            }
+        }
+        let average = (weight > Decimal::ZERO).then(|| weighted / weight);
+        let open_orders: Vec<String> = open
+            .into_iter()
+            .filter(|order| order.order.symbol == position.symbol)
+            .map(|order| order.order.client_order_id.0)
+            .collect();
+        books.insert(
+            *venue,
+            VenueSymbolBook {
+                net,
+                average,
+                open_orders,
+            },
+        );
+    }
+    // 没成交的那一腿还在：不补已成交的腿，也不能收成已平。
+    for order in &live_orders {
+        if filled_venues.contains(&order.order.venue) {
+            continue;
+        }
+        let Some(book) = books.get(&order.order.venue) else {
+            return Ok(OpeningRestore::Held(format!(
+                "{} 没查到，没有补记",
+                order.order.venue
+            )));
+        };
+        if !book.net.is_zero() {
+            return Ok(OpeningRestore::Held(format!(
+                "{} 还没成交的那一腿仍有持仓（净数量 {}），没有补记，也不能按已平仓结束",
+                order.order.venue,
+                book.net.normalize()
+            )));
+        }
+        if !book.open_orders.is_empty() {
+            return Ok(OpeningRestore::Held(format!(
+                "{} 还有挂单（{}），没有补记，也不能按已平仓结束",
+                order.order.venue,
+                book.open_orders.join("、")
+            )));
+        }
+    }
+
+    let mut open_orders = Vec::new();
+    for venue in &venues {
+        let Some(book) = books.get(venue) else {
+            continue;
+        };
+        for id in &book.open_orders {
+            if !open_orders.contains(id) {
+                open_orders.push(id.clone());
+            }
+        }
+    }
+
+    let mut written = Vec::new();
+    let mut resize_notes = Vec::new();
+    for leg in &order_legs {
+        let Some(book) = books.get(&leg.venue) else {
+            continue;
+        };
+        if book.net.is_zero() {
+            continue;
+        }
+        let aligned = match leg.side {
+            Side::Buy => book.net.is_sign_positive(),
+            Side::Sell => book.net.is_sign_negative(),
+        };
+        if !aligned {
+            return Ok(OpeningRestore::Held(format!(
+                "{} 的持仓方向和这笔订单相反：订单是{}，交易所净数量 {}，没有补记",
+                leg.venue,
+                side_word(leg.side),
+                book.net.normalize()
+            )));
+        }
+        let Some(order_qty) = leg.quantity() else {
+            return Ok(OpeningRestore::Held(format!(
+                "{} 的开仓成交没有价格，没有补记",
+                leg.venue
+            )));
+        };
+        let venue_qty = book.net.abs();
+        if crate::reconcile::quantities_match(order_qty, venue_qty) {
+            written.push(leg.clone());
+            continue;
+        }
+        let price = book
+            .average
+            .filter(|price| *price > Decimal::ZERO)
+            .unwrap_or(leg.average_price);
+        if price <= Decimal::ZERO {
+            return Ok(OpeningRestore::Held(format!(
+                "{} 的持仓数量对不上订单，又没有均价，没有补记",
+                leg.venue
+            )));
+        }
+        let mut resized = leg.clone();
+        resized.notional_usdt = venue_qty * price;
+        if order_qty > Decimal::ZERO {
+            resized.fee_usdt = leg.fee_usdt * venue_qty / order_qty;
+        }
+        written.push(resized);
+        resize_notes.push(format!(
+            "{} 订单成交 {}，交易所净持仓 {}",
+            leg.venue,
+            order_qty.normalize(),
+            venue_qty.normalize()
+        ));
+    }
+
+    if written.is_empty() {
+        if open_orders.is_empty() {
+            return Ok(OpeningRestore::Flat);
+        }
+        return Ok(OpeningRestore::Held(format!(
+            "交易所这个合约已经没有持仓，但还有挂单（{}），不能按已平仓补记",
+            open_orders.join("、")
+        )));
+    }
+
+    let mut restored = position.clone();
+    restored.long = None;
+    restored.short = None;
+    for leg in written {
+        let leg = leg_with_margin(&restored, leg);
+        match leg.side {
+            Side::Buy => restored.long = Some(leg),
+            Side::Sell => restored.short = Some(leg),
+        }
+    }
+    if let (Some(long), Some(short)) = (&restored.long, &restored.short) {
+        restored.entry_legs = Some(crate::EntryLegs {
+            long: long.clone(),
+            short: short.clone(),
+        });
+    }
+    restored.status = PositionStatus::Open;
+    let described = [restored.long.as_ref(), restored.short.as_ref()]
+        .into_iter()
+        .flatten()
+        .map(|leg| {
+            format!(
+                "{} {} 数量 {}，均价 {}",
+                leg.venue,
+                side_word(leg.side),
+                leg.quantity().unwrap_or_default().normalize(),
+                leg.average_price.normalize()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("；");
+    let mut note = format!("手动核实：按交易所持仓补记（{described}）");
+    if !resize_notes.is_empty() {
+        note.push_str("。数量和订单成交不一致，以交易所为准：");
+        note.push_str(&resize_notes.join("；"));
+    }
+    if !open_orders.is_empty() {
+        note.push_str("。交易所仍有挂单：");
+        note.push_str(&open_orders.join("、"));
+    }
+    if !restored.is_hedged() {
+        note.push_str("。只补上了交易所还在的腿，另一边没有仓：这是裸敞口，不会自动平");
+    }
+    restored.note = Some(note);
+    ledger
+        .append(&Record::Position(Box::new(restored.clone())))
+        .await?;
+    warn!(
+        position = %restored.id,
+        symbol = %restored.symbol,
+        "手动核实按交易所持仓补记了没写下的腿"
+    );
+    Ok(OpeningRestore::Restored(restored))
+}
+
+struct VenueSymbolBook {
+    net: Decimal,
+    average: Option<Decimal>,
+    open_orders: Vec<String>,
+}
+
+fn side_word(side: Side) -> &'static str {
+    match side {
+        Side::Buy => "多",
+        Side::Sell => "空",
+    }
+}
+
+fn leg_with_margin(position: &PairPosition, mut leg: crate::LegFill) -> crate::LegFill {
+    leg.margin_usdt = position
+        .leverage
+        .filter(|leverage| !position.margin_mode.is_cross() && *leverage > Decimal::ZERO)
+        .map(|leverage| leg.notional_usdt / leverage);
+    leg
 }
 
 const MANUAL_EXTERNAL: &str = "人工外部处理";
@@ -2507,6 +2848,12 @@ pub fn implicated_position_ids(
         if let Some(why) = position_rules_blocked(position, recon, &replayed.orders) {
             out.insert(position.id.clone(), why);
         }
+    }
+    // 对账看不出不一致时，开仓中断但订单已有成交的仍要留在待核实名单里。
+    // 已经有更具体原因的不覆盖。
+    for id in opening_ids_with_unrecorded_fills(replayed) {
+        out.entry(id)
+            .or_insert_with(|| "开仓中断，台账没记下腿，要到对应交易所核实".into());
     }
     out
 }
@@ -5983,6 +6330,479 @@ mod tests {
                 take_profit_usdt: Some(dec!(1)),
                 ..TaskRules::default()
             }
+        }
+    }
+
+    mod restore_opening {
+        use super::super::*;
+        use crate::broker::VenuePosition;
+        use crate::reconcile::DivergenceKind;
+        use crate::types::{ClientOrderId, NewOrder, OrderAck, OrderState, OrderStatus};
+        use arb_core::{ArbResult, Side};
+        use async_trait::async_trait;
+        use rust_decimal_macros::dec;
+
+        struct Book {
+            venue: Venue,
+            positions: Vec<VenuePosition>,
+            orders: Vec<OrderState>,
+            fail_positions: bool,
+        }
+
+        #[async_trait]
+        impl Broker for Book {
+            fn venue(&self) -> Venue {
+                self.venue
+            }
+            async fn place(&self, _: &NewOrder) -> ArbResult<OrderAck> {
+                panic!("按交易所持仓补记不该下单");
+            }
+            async fn order_state(&self, _: &ClientOrderId) -> ArbResult<Option<OrderState>> {
+                Ok(None)
+            }
+            async fn cancel(&self, _: &str) -> ArbResult<()> {
+                panic!("按交易所持仓补记不该撤单");
+            }
+            async fn open_orders(&self) -> ArbResult<Vec<OrderState>> {
+                Ok(self.orders.clone())
+            }
+            async fn positions(&self) -> ArbResult<Vec<VenuePosition>> {
+                if self.fail_positions {
+                    return Err(arb_core::ArbError::venue(self.venue.as_str(), "查询失败"));
+                }
+                Ok(self.positions.clone())
+            }
+            fn fee_per_side(&self) -> Decimal {
+                Decimal::ZERO
+            }
+        }
+
+        fn symbol() -> Symbol {
+            Symbol::perp("PONS", "USDT")
+        }
+
+        fn book(venue: Venue, net: Decimal, price: Decimal) -> Book {
+            let positions = if net.is_zero() {
+                Vec::new()
+            } else {
+                vec![VenuePosition {
+                    venue,
+                    symbol: symbol(),
+                    net_quantity: net,
+                    average_price: Some(price),
+                    notional_usdt: net.abs() * price,
+                }]
+            };
+            Book {
+                venue,
+                positions,
+                orders: Vec::new(),
+                fail_positions: false,
+            }
+        }
+
+        fn opening() -> PairPosition {
+            PairPosition {
+                margin_mode: crate::MarginMode::Isolated,
+                id: "live-1".into(),
+                symbol: symbol(),
+                strategy: Strategy::Funding,
+                long: None,
+                short: None,
+                entry_basis_pct: Decimal::ZERO,
+                expected_round_trip_cost: Decimal::ZERO,
+                status: PositionStatus::Opening,
+                opened_at: chrono::Utc::now(),
+                closed_at: None,
+                note: None,
+                leverage: Some(dec!(4)),
+                rules: TaskRules::default(),
+                trims: 0,
+                exits: 0,
+                margin_added_usdt: Decimal::ZERO,
+                realized_pnl_usdt: Decimal::ZERO,
+                realized_fee_usdt: Decimal::ZERO,
+                realized_source: None,
+                realized_funding_usdt: None,
+                funding_checked_at: None,
+                closed_externally: false,
+                entry_legs: None,
+                pnl_unattributed: None,
+                open_report: None,
+                origin: None,
+            }
+        }
+
+        fn filled(
+            position: &PairPosition,
+            side: Side,
+            venue: Venue,
+            qty: Decimal,
+            price: Decimal,
+        ) -> OrderState {
+            let mut order = OrderState::new(NewOrder {
+                client_order_id: ClientOrderId::for_leg(&position.id, side, 0),
+                venue,
+                symbol: position.symbol.clone(),
+                side,
+                notional_usdt: qty * price,
+                quantity: Some(qty),
+                limit_price: None,
+                reduce_only: false,
+                margin_mode: crate::MarginMode::Isolated,
+                leverage: Some(dec!(4)),
+            });
+            order.status = OrderStatus::Filled;
+            order.filled_usdt = qty * price;
+            order.average_price = Some(price);
+            order.fee_usdt = dec!(1);
+            order
+        }
+
+        async fn ledger_with(
+            name: &str,
+            orders: Vec<OrderState>,
+        ) -> (Ledger, std::path::PathBuf, PairPosition) {
+            let path = std::env::temp_dir()
+                .join(format!("arb-restore-{name}-{}.jsonl", std::process::id()));
+            let _ = tokio::fs::remove_file(&path).await;
+            let ledger = Ledger::open(&path).await.unwrap();
+            let position = opening();
+            for order in orders {
+                ledger
+                    .append(&Record::Order(Box::new(order)))
+                    .await
+                    .unwrap();
+            }
+            ledger
+                .append(&Record::Position(Box::new(position.clone())))
+                .await
+                .unwrap();
+            (ledger, path, position)
+        }
+
+        fn brokers(books: Vec<Book>) -> HashMap<Venue, Arc<dyn Broker>> {
+            books
+                .into_iter()
+                .map(|book| (book.venue, Arc::new(book) as Arc<dyn Broker>))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn matching_venue_positions_are_written_as_an_open_hedge() {
+            let (ledger, path, position) = ledger_with(
+                "both",
+                vec![
+                    filled(&opening(), Side::Buy, Venue::LighterRh, dec!(10), dec!(2)),
+                    filled(&opening(), Side::Sell, Venue::Arcus, dec!(10), dec!(3)),
+                ],
+            )
+            .await;
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![
+                    book(Venue::LighterRh, dec!(10), dec!(2)),
+                    book(Venue::Arcus, dec!(-10), dec!(3)),
+                ]),
+                &position,
+            )
+            .await
+            .unwrap();
+            let OpeningRestore::Restored(restored) = outcome else {
+                panic!("应补成持仓");
+            };
+            assert_eq!(restored.status, PositionStatus::Open);
+            assert_eq!(restored.long.as_ref().unwrap().quantity(), Some(dec!(10)));
+            assert_eq!(restored.short.as_ref().unwrap().quantity(), Some(dec!(10)));
+            assert_eq!(
+                restored.long.as_ref().unwrap().margin_usdt,
+                Some(dec!(20) / dec!(4))
+            );
+            assert!(restored.entry_legs.is_some());
+            let after = reconcile_ledger(
+                &ledger,
+                &brokers(vec![
+                    book(Venue::LighterRh, dec!(10), dec!(2)),
+                    book(Venue::Arcus, dec!(-10), dec!(3)),
+                ]),
+            )
+            .await
+            .unwrap();
+            assert!(after.is_clean(), "{:?}", after.divergences);
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn a_single_remaining_leg_is_recorded_and_not_closed() {
+            let (ledger, path, position) = ledger_with(
+                "one",
+                vec![
+                    filled(&opening(), Side::Buy, Venue::LighterRh, dec!(10), dec!(2)),
+                    filled(&opening(), Side::Sell, Venue::Arcus, dec!(10), dec!(3)),
+                ],
+            )
+            .await;
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![
+                    book(Venue::LighterRh, dec!(10), dec!(2)),
+                    book(Venue::Arcus, Decimal::ZERO, dec!(3)),
+                ]),
+                &position,
+            )
+            .await
+            .unwrap();
+            let OpeningRestore::Restored(restored) = outcome else {
+                panic!("应补上还在的那条腿");
+            };
+            assert!(restored.long.is_some() && restored.short.is_none());
+            assert!(restored.note.unwrap().contains("裸敞口"));
+            let after = reconcile_ledger(
+                &ledger,
+                &brokers(vec![
+                    book(Venue::LighterRh, dec!(10), dec!(2)),
+                    book(Venue::Arcus, Decimal::ZERO, dec!(3)),
+                ]),
+            )
+            .await
+            .unwrap();
+            assert!(
+                after
+                    .divergences
+                    .iter()
+                    .any(|item| item.kind == DivergenceKind::NakedLeg),
+                "{:?}",
+                after.divergences
+            );
+            assert!(
+                !after
+                    .divergences
+                    .iter()
+                    .any(|item| item.kind == DivergenceKind::PositionMismatch)
+            );
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn a_smaller_venue_position_is_recorded_at_the_venue_size() {
+            let (ledger, path, position) = ledger_with(
+                "resize",
+                vec![filled(
+                    &opening(),
+                    Side::Buy,
+                    Venue::LighterRh,
+                    dec!(10),
+                    dec!(2),
+                )],
+            )
+            .await;
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![book(Venue::LighterRh, dec!(4), dec!(2))]),
+                &position,
+            )
+            .await
+            .unwrap();
+            let OpeningRestore::Restored(restored) = outcome else {
+                panic!("应按交易所数量补记");
+            };
+            let long = restored.long.unwrap();
+            assert_eq!(long.quantity(), Some(dec!(4)));
+            assert_eq!(long.fee_usdt, dec!(1) * dec!(4) / dec!(10));
+            assert!(restored.note.unwrap().contains("以交易所为准"));
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn flat_venues_are_left_for_the_external_close() {
+            let (ledger, path, position) = ledger_with(
+                "flat",
+                vec![filled(
+                    &opening(),
+                    Side::Buy,
+                    Venue::LighterRh,
+                    dec!(10),
+                    dec!(2),
+                )],
+            )
+            .await;
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![book(Venue::LighterRh, Decimal::ZERO, dec!(2))]),
+                &position,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, OpeningRestore::Flat));
+            let (replayed, _) = ledger.replay().await.unwrap();
+            assert_eq!(replayed.positions["live-1"].status, PositionStatus::Opening);
+            assert!(replayed.positions["live-1"].long.is_none());
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn a_resting_order_on_a_flat_venue_is_not_closed() {
+            let (ledger, path, position) = ledger_with(
+                "resting",
+                vec![filled(
+                    &opening(),
+                    Side::Buy,
+                    Venue::LighterRh,
+                    dec!(10),
+                    dec!(2),
+                )],
+            )
+            .await;
+            let mut venue = book(Venue::LighterRh, Decimal::ZERO, dec!(2));
+            venue.orders.push(filled(
+                &position,
+                Side::Buy,
+                Venue::LighterRh,
+                dec!(1),
+                dec!(2),
+            ));
+            venue.orders[0].status = OrderStatus::Open;
+            let outcome = restore_opening_from_venues(&ledger, &brokers(vec![venue]), &position)
+                .await
+                .unwrap();
+            let OpeningRestore::Held(reason) = outcome else {
+                panic!("空仓但仍有挂单时不能收成已平");
+            };
+            assert!(reason.contains("还有挂单"), "{reason}");
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn a_failed_position_query_does_not_write() {
+            let (ledger, path, position) = ledger_with(
+                "down",
+                vec![filled(
+                    &opening(),
+                    Side::Buy,
+                    Venue::LighterRh,
+                    dec!(10),
+                    dec!(2),
+                )],
+            )
+            .await;
+            let mut venue = book(Venue::LighterRh, dec!(10), dec!(2));
+            venue.fail_positions = true;
+            let outcome = restore_opening_from_venues(&ledger, &brokers(vec![venue]), &position)
+                .await
+                .unwrap();
+            let OpeningRestore::Held(reason) = outcome else {
+                panic!("查失败时不能补记");
+            };
+            assert!(reason.contains("没查成"), "{reason}");
+            let (replayed, _) = ledger.replay().await.unwrap();
+            assert!(replayed.positions["live-1"].long.is_none());
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn the_opposite_venue_side_is_not_written() {
+            let (ledger, path, position) = ledger_with(
+                "flip",
+                vec![filled(
+                    &opening(),
+                    Side::Buy,
+                    Venue::LighterRh,
+                    dec!(10),
+                    dec!(2),
+                )],
+            )
+            .await;
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![book(Venue::LighterRh, dec!(-10), dec!(2))]),
+                &position,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, OpeningRestore::Held(_)));
+            let (replayed, _) = ledger.replay().await.unwrap();
+            assert!(replayed.positions["live-1"].long.is_none());
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        fn resting(position: &PairPosition, side: Side, venue: Venue) -> OrderState {
+            let mut order = filled(position, side, venue, dec!(10), dec!(3));
+            order.status = OrderStatus::Open;
+            order.filled_usdt = Decimal::ZERO;
+            order.average_price = None;
+            order.fee_usdt = Decimal::ZERO;
+            order
+        }
+
+        #[tokio::test]
+        async fn an_unfilled_live_order_on_the_other_venue_is_not_closed() {
+            let position = opening();
+            let open = resting(&position, Side::Sell, Venue::Arcus);
+            let (ledger, path, position) = ledger_with(
+                "live-other",
+                vec![
+                    filled(&position, Side::Buy, Venue::LighterRh, dec!(10), dec!(2)),
+                    open.clone(),
+                ],
+            )
+            .await;
+            let mut other = book(Venue::Arcus, Decimal::ZERO, dec!(3));
+            other.orders.push(open);
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![book(Venue::LighterRh, Decimal::ZERO, dec!(2)), other]),
+                &position,
+            )
+            .await
+            .unwrap();
+            let OpeningRestore::Held(reason) = outcome else {
+                panic!("另一腿还挂着时不能收成已平");
+            };
+            assert!(reason.contains("还有挂单"), "{reason}");
+            let (replayed, _) = ledger.replay().await.unwrap();
+            assert_eq!(replayed.positions["live-1"].status, PositionStatus::Opening);
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn a_gone_unfilled_order_can_be_closed_when_every_venue_is_flat() {
+            let position = opening();
+            let (ledger, path, position) = ledger_with(
+                "live-gone",
+                vec![
+                    filled(&position, Side::Buy, Venue::LighterRh, dec!(10), dec!(2)),
+                    resting(&position, Side::Sell, Venue::Arcus),
+                ],
+            )
+            .await;
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![
+                    book(Venue::LighterRh, Decimal::ZERO, dec!(2)),
+                    book(Venue::Arcus, Decimal::ZERO, dec!(3)),
+                ]),
+                &position,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(outcome, OpeningRestore::Flat));
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[test]
+        fn an_opening_with_unrecorded_fills_stays_pending_when_reconcile_is_clean() {
+            let position = opening();
+            let order = filled(&position, Side::Buy, Venue::LighterRh, dec!(10), dec!(2));
+            let mut replayed = Replayed::default();
+            replayed
+                .orders
+                .insert(order.order.client_order_id.0.clone(), order);
+            replayed.positions.insert(position.id.clone(), position);
+            let ids = implicated_position_ids(&replayed, &Reconciliation::default());
+            assert_eq!(
+                ids.get("live-1").map(String::as_str),
+                Some("开仓中断，台账没记下腿，要到对应交易所核实")
+            );
         }
     }
 }

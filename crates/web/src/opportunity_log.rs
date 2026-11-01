@@ -143,7 +143,9 @@ fn row_pct(row: &Value, field: &str) -> Option<Decimal> {
         .and_then(|text| text.parse::<Decimal>().ok())
 }
 
-/// 推送文案。价差数字来自机会记录；`depth_net_pct` 是预检吃完深度后的净价差（%）。
+/// 推送文案。价差和盈亏与价差提醒同一个口径：
+/// 可成交价差是吃完这笔名义后的开仓价差；回到正常的净赚 = 该价差扣掉平仓穿价和往返手续费，
+/// 再减去正常基差（正常基差按空腿减多腿）。不把持有期资金费算进这一行。
 pub fn manual_push_text(
     base: &str,
     long: &str,
@@ -151,32 +153,44 @@ pub fn manual_push_text(
     size: Decimal,
     leverage: Decimal,
     entry_pct: Decimal,
-    price_net_pct: Decimal,
-    net_to_normal_pct: Decimal,
-    depth_net_pct: Option<Decimal>,
+    normal_basis_pct: Decimal,
+    basis_pct: Decimal,
+    session: &str,
+    depth_net_pct: Decimal,
 ) -> String {
-    let profit_usdt = (net_to_normal_pct / Decimal::ONE_HUNDRED * size)
+    let raw_net = depth_net_pct - normal_basis_pct;
+    let net_pct = raw_net.round_dp(3);
+    let profit_usdt = (raw_net / Decimal::ONE_HUNDRED * size)
         .round_dp(2)
         .normalize();
-    let depth = depth_net_pct.map_or_else(String::new, |net| {
-        format!("吃完深度后净价差 {}%。", net.normalize())
-    });
+    let long_label = venue_name(long);
+    let short_label = venue_name(short);
     format!(
-        "手动机会已通过预检：{base} 多 {long} / 空 {short}，{} USDT × {}x。可成交价差 {}%，扣费后净 {}%。{depth}回到正常预估盈利 {}%（约 {profit_usdt} USDT）。30 分钟内有效，用过即废。下单前仍按自动开仓标准重查。",
+        "手动机会已通过预检：{base} 多 {long_label} / 空 {short_label}，{} USDT × {}x\n可成交价差 {}%（{} USDT），{session}正常基差 {}%，当前 {}%（{short_label} − {long_label}）\n回到正常水平预估净赚 {}%（≈{profit_usdt} USDT，已扣手续费与平仓穿价）\n30 分钟内有效，用过即废。下单前仍按自动开仓标准重查。",
         size.normalize(),
         leverage.normalize(),
-        entry_pct.normalize(),
-        price_net_pct.normalize(),
-        net_to_normal_pct.normalize(),
+        entry_pct.round_dp(3).normalize(),
+        size.normalize(),
+        normal_basis_pct.round_dp(3).normalize(),
+        basis_pct.round_dp(3).normalize(),
+        net_pct.normalize(),
         profit_usdt = profit_usdt,
     )
+}
+
+fn venue_name(name: &str) -> String {
+    Venue::parse(name)
+        .map(crate::rh_spread::venue_label)
+        .unwrap_or(name)
+        .to_string()
 }
 
 /// 最近一轮里、已经达到预检标准的这组手动机会的价差。
 pub struct ManualSpread {
     pub entry_pct: Decimal,
-    pub price_net_pct: Decimal,
-    pub net_to_normal_pct: Decimal,
+    pub normal_basis_pct: Decimal,
+    pub basis_pct: Decimal,
+    pub session_label: String,
 }
 
 pub fn spread_for_push(base: &str, long: Venue, short: Venue) -> Option<ManualSpread> {
@@ -191,8 +205,12 @@ pub fn spread_for_push(base: &str, long: Venue, short: Venue) -> Option<ManualSp
         }
         Some(ManualSpread {
             entry_pct: row_pct(&row, "entry_pct")?,
-            price_net_pct: row_pct(&row, "price_net_pct")?,
-            net_to_normal_pct: row_pct(&row, "net_to_normal_pct")?,
+            normal_basis_pct: row_pct(&row, "normal_basis_pct")?,
+            basis_pct: row_pct(&row, "basis_pct")?,
+            session_label: session_from_name(row["normal_session"].as_str().unwrap_or(""))
+                .map(Session::label)
+                .unwrap_or("当前")
+                .to_string(),
         })
     })
 }
@@ -936,6 +954,9 @@ fn attach_normal(value: &mut Value, normal: Option<&Normal>, mark_basis: Option<
     };
     value["normal_basis_pct"] = json!(format!("{:.4}", normal.median));
     value["normal_session"] = json!(normal.session);
+    value["basis_pct"] = mark_basis.map_or(Value::Null, |basis| {
+        json!(basis.round_dp(4).normalize().to_string())
+    });
     value["normal_minutes"] = json!(normal.minutes);
     let price = mark_basis.and_then(|basis| basis.to_f64()).map(|basis| {
         // 标记价基差已经是（空 − 多）。回到中位数时，多出来的那一段才是能收回的。
@@ -1202,6 +1223,31 @@ struct Logged {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn manual_push_uses_the_spread_alert_accounting() {
+        use rust_decimal_macros::dec;
+        let text = super::manual_push_text(
+            "SPY",
+            "lighter-rh",
+            "arcus",
+            dec!(300),
+            dec!(3),
+            dec!(0.184),
+            dec!(-0.072),
+            dec!(0.222),
+            "周末",
+            dec!(0.055),
+        );
+        assert!(
+            text.contains("可成交价差 0.184%（300 USDT），周末正常基差 -0.072%，当前 0.222%（Arcus − Lighter RH）"),
+            "{text}"
+        );
+        assert!(
+            text.contains("回到正常水平预估净赚 0.127%（≈0.38 USDT，已扣手续费与平仓穿价）"),
+            "{text}"
+        );
+    }
+
     use super::*;
     use arb_core::Symbol;
     use arb_scanner::Opportunity;
