@@ -597,7 +597,11 @@ fn selection_net(opportunity: &Opportunity, normals: Option<&HashMap<String, Nor
 }
 
 /// 一档回到正常净收益（%）：可成交价差扣掉平仓穿价和往返手续费，再减去正常基差，加上 8 小时资金费。
-fn quote_net_to_normal(price_net_pct: Decimal, normal_pct: Decimal, funding_pct: Decimal) -> Decimal {
+fn quote_net_to_normal(
+    price_net_pct: Decimal,
+    normal_pct: Decimal,
+    funding_pct: Decimal,
+) -> Decimal {
     (price_net_pct - normal_pct + funding_pct).round_dp(4)
 }
 
@@ -1323,7 +1327,9 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("回到正常水平预估净赚 0.127%（≈0.38 USDT，已扣手续费与平仓穿价，含 8 小时资金费）"),
+            text.contains(
+                "回到正常水平预估净赚 0.127%（≈0.38 USDT，已扣手续费与平仓穿价，含 8 小时资金费）"
+            ),
             "{text}"
         );
     }

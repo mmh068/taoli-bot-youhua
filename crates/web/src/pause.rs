@@ -131,6 +131,8 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned_long: None,
+            planned_short: None,
         }
     }
 

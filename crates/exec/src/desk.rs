@@ -877,7 +877,7 @@ fn orders_have_fills(replayed: &Replayed, position: &PairPosition) -> bool {
 }
 
 /// 这笔仓位还挂在场上的订单。没成交也算：第二腿还挂着时不能当成已经结束。
-fn live_orders_of<'a>(replayed: &'a Replayed, position: &PairPosition) -> Vec<&'a OrderState> {
+fn orders_of<'a>(replayed: &'a Replayed, position: &PairPosition) -> Vec<&'a OrderState> {
     let prefix = position_order_prefix(&position.id);
     replayed
         .orders
@@ -885,9 +885,59 @@ fn live_orders_of<'a>(replayed: &'a Replayed, position: &PairPosition) -> Vec<&'
         .filter(|order| {
             order.order.client_order_id.0.starts_with(&prefix)
                 && order.order.symbol == position.symbol
-                && order.status.is_live()
+                && !order.order.reduce_only
         })
         .collect()
+}
+
+fn same_planned_venue(
+    current: Option<Venue>,
+    venue: Venue,
+    label: &str,
+) -> std::result::Result<Option<Venue>, String> {
+    match current {
+        None => Ok(Some(venue)),
+        Some(existing) if existing == venue => Ok(Some(existing)),
+        Some(existing) => Err(format!(
+            "{label}计划在 {existing}，另一处记成 {venue}，没有补记"
+        )),
+    }
+}
+
+/// 这笔开仓计划的多头场所和空头场所。优先用落盘的计划，旧台账再从已记的腿、订单和执行报告补。
+fn planned_venues(
+    position: &PairPosition,
+    replayed: &Replayed,
+) -> std::result::Result<(Venue, Venue), String> {
+    let mut long = position.planned_long;
+    let mut short = position.planned_short;
+    if let Some(leg) = &position.long {
+        long = same_planned_venue(long, leg.venue, "多腿")?;
+    }
+    if let Some(leg) = &position.short {
+        short = same_planned_venue(short, leg.venue, "空腿")?;
+    }
+    for order in orders_of(replayed, position) {
+        match order.order.side {
+            Side::Buy => long = same_planned_venue(long, order.order.venue, "多腿")?,
+            Side::Sell => short = same_planned_venue(short, order.order.venue, "空腿")?,
+        }
+    }
+    if let Some(report) = &position.open_report {
+        for leg in [&report.first, &report.second] {
+            match leg.side {
+                Side::Buy => long = same_planned_venue(long, leg.venue, "多腿")?,
+                Side::Sell => short = same_planned_venue(short, leg.venue, "空腿")?,
+            }
+        }
+    }
+    match (long, short) {
+        (Some(long), Some(short)) if long != short => Ok((long, short)),
+        (Some(venue), Some(_)) => {
+            Err(format!("这笔计划的两家都记成了 {venue}，不能按净持仓补记"))
+        }
+        _ => Err("这笔计划的两家交易所没有记全，不能按两边的真实持仓补记".into()),
+    }
 }
 
 /// 按这笔仓位的开仓成交单重建腿：同一场所同一方向多张单合成一条。
@@ -944,34 +994,51 @@ pub enum OpeningRestore {
     Held(String),
 }
 
-/// 开仓中断、台账没记下腿、但订单有成交时，按这笔订单对应的交易所持仓补记。
+/// 开仓中断、台账没记下腿，或已经只写下一条腿时，按这笔订单对应的交易所持仓补记。
 ///
-/// 只查订单成交过的场所，不扫整本账户来猜测。净持仓和订单成交对得上就用订单的价格、
-/// 手续费；对不上就按交易所的数量改，价格仍优先用交易所均价。没成交但还挂着的那一腿
-/// 也要查：那边还有仓或这张单还在，整笔保持不动。成交过的场所和这些未成交的场所都
-/// 归零、也没有挂单时，返回 [`OpeningRestore::Flat`]，由调用方按人工外部处理结束。
-/// 查询失败、方向相反、或同一笔收不进两条腿时不写。
+/// 每次都查这笔计划里的两家，按它们现在的真实持仓决定，不下单、不撤单。
+/// 已经只写下一条腿的，下次核实仍查这两家，不跳过缺的那一边。
+/// 两家都有仓且方向和这笔的多空一致：两条腿都按交易所净持仓补上，记成正常对冲。
+/// 只有一家有仓，另一家这个合约没有仓、也没有挂单：只补还在的那一条，标成裸敞口，不自动平。
+/// 没仓却还有挂单，整笔保持不动。
+/// 两条腿都还没写下、相关场所都归零且没有挂单时，返回 [`OpeningRestore::Flat`]，
+/// 由调用方按人工外部处理结束。已经写下一条腿后又两边归零的，这里不结束，交给对账确认。
+/// 两家没记全、查询失败、方向相反、或同一笔收不进两条腿时不写。
 pub async fn restore_opening_from_venues(
     ledger: &Ledger,
     brokers: &HashMap<Venue, Arc<dyn Broker>>,
     position: &PairPosition,
 ) -> Result<OpeningRestore> {
-    if position.status != PositionStatus::Opening
-        || position.long.is_some()
-        || position.short.is_some()
-    {
+    let opening_blank = position.status == PositionStatus::Opening
+        && position.long.is_none()
+        && position.short.is_none();
+    let one_recorded = matches!(
+        position.status,
+        PositionStatus::Opening | PositionStatus::Open
+    ) && position.long.is_some() != position.short.is_some();
+    if !opening_blank && !one_recorded {
         return Ok(OpeningRestore::Held(
-            "这笔不是没记下腿的开仓，没有按交易所持仓补记".into(),
+            "这笔不是缺腿的开仓，没有按交易所持仓补记".into(),
         ));
     }
     let (replayed, _) = ledger.replay().await?;
+    let (long_venue, short_venue) = match planned_venues(position, &replayed) {
+        Ok(pair) => pair,
+        Err(reason) => return Ok(OpeningRestore::Held(reason)),
+    };
     let mut order_legs = filled_open_legs(&replayed, position);
-    order_legs.sort_by_key(|leg| (leg.venue.as_str(), matches!(leg.side, Side::Sell)));
-    if order_legs.is_empty() {
-        return Ok(OpeningRestore::Held(
-            "订单有成交，但没有能对照的开仓成交，没有补记".into(),
-        ));
+    for leg in [position.long.clone(), position.short.clone()]
+        .into_iter()
+        .flatten()
+    {
+        if !order_legs
+            .iter()
+            .any(|have| have.venue == leg.venue && have.side == leg.side)
+        {
+            order_legs.push(leg);
+        }
     }
+    order_legs.sort_by_key(|leg| (leg.venue.as_str(), matches!(leg.side, Side::Sell)));
     if order_legs
         .iter()
         .filter(|leg| leg.side == Side::Buy)
@@ -987,19 +1054,7 @@ pub async fn restore_opening_from_venues(
             "同一方向有多条成交腿，收不进一笔仓位，没有补记".into(),
         ));
     }
-    let mut venues: Vec<Venue> = order_legs.iter().map(|leg| leg.venue).collect();
-    venues.sort_by_key(|venue| venue.as_str());
-    venues.dedup();
-    let live_orders = live_orders_of(&replayed, position);
-    let filled_venues: std::collections::HashSet<Venue> =
-        order_legs.iter().map(|leg| leg.venue).collect();
-    for order in &live_orders {
-        if !venues.contains(&order.order.venue) {
-            venues.push(order.order.venue);
-        }
-    }
-    venues.sort_by_key(|venue| venue.as_str());
-    venues.dedup();
+    let venues = vec![long_venue, short_venue];
     for other in replayed.positions.values() {
         if other.id == position.id
             || other.symbol != position.symbol
@@ -1079,29 +1134,64 @@ pub async fn restore_opening_from_venues(
             },
         );
     }
-    // 没成交的那一腿还在：不补已成交的腿，也不能收成已平。
-    for order in &live_orders {
-        if filled_venues.contains(&order.order.venue) {
+    // 计划里的两家都要看。缺的那一边没有订单时，也不能把它当成已经查过。
+    for (venue, side) in [(long_venue, Side::Buy), (short_venue, Side::Sell)] {
+        let Some(book) = books.get(&venue) else {
+            return Ok(OpeningRestore::Held(format!("{venue} 没查到，没有补记")));
+        };
+        if book.net.is_zero() {
+            if !book.open_orders.is_empty() {
+                return Ok(OpeningRestore::Held(format!(
+                    "{venue} 还有挂单（{}），没有补记，也不能按已平仓结束",
+                    book.open_orders.join("、")
+                )));
+            }
             continue;
         }
+        let aligned = match side {
+            Side::Buy => book.net.is_sign_positive(),
+            Side::Sell => book.net.is_sign_negative(),
+        };
+        if !aligned {
+            return Ok(OpeningRestore::Held(format!(
+                "{venue} 的持仓方向和这笔计划相反：计划是{}，交易所净数量 {}，没有补记",
+                side_word(side),
+                book.net.normalize()
+            )));
+        }
+    }
+    // 没记下成交的那一腿：同方向已经有仓，就留到下面按持仓补上。
+    // 没仓但挂单还在，不能只补另一条，也不能收成已平。方向反了整笔不动。
+    for order in orders_of(&replayed, position) {
         let Some(book) = books.get(&order.order.venue) else {
             return Ok(OpeningRestore::Held(format!(
                 "{} 没查到，没有补记",
                 order.order.venue
             )));
         };
-        if !book.net.is_zero() {
-            return Ok(OpeningRestore::Held(format!(
-                "{} 还没成交的那一腿仍有持仓（净数量 {}），没有补记，也不能按已平仓结束",
-                order.order.venue,
-                book.net.normalize()
-            )));
+        let recorded = order_legs
+            .iter()
+            .any(|leg| leg.venue == order.order.venue && leg.side == order.order.side);
+        if book.net.is_zero() {
+            if !recorded && !book.open_orders.is_empty() {
+                return Ok(OpeningRestore::Held(format!(
+                    "{} 还有挂单（{}），没有补记，也不能按已平仓结束",
+                    order.order.venue,
+                    book.open_orders.join("、")
+                )));
+            }
+            continue;
         }
-        if !book.open_orders.is_empty() {
+        let aligned = match order.order.side {
+            Side::Buy => book.net.is_sign_positive(),
+            Side::Sell => book.net.is_sign_negative(),
+        };
+        if !aligned {
             return Ok(OpeningRestore::Held(format!(
-                "{} 还有挂单（{}），没有补记，也不能按已平仓结束",
+                "{} 的持仓方向和这笔订单相反：订单是{}，交易所净数量 {}，没有补记",
                 order.order.venue,
-                book.open_orders.join("、")
+                side_word(order.order.side),
+                book.net.normalize()
             )));
         }
     }
@@ -1116,6 +1206,87 @@ pub async fn restore_opening_from_venues(
                 open_orders.push(id.clone());
             }
         }
+    }
+
+    for order in orders_of(&replayed, position) {
+        if order_legs
+            .iter()
+            .any(|leg| leg.venue == order.order.venue && leg.side == order.order.side)
+        {
+            continue;
+        }
+        let Some(book) = books.get(&order.order.venue) else {
+            continue;
+        };
+        if book.net.is_zero() {
+            continue;
+        }
+        let price = book
+            .average
+            .filter(|price| *price > Decimal::ZERO)
+            .or(order.average_price)
+            .unwrap_or_default();
+        if price <= Decimal::ZERO {
+            return Ok(OpeningRestore::Held(format!(
+                "{} 已经有持仓，但没有均价，没有补记",
+                order.order.venue
+            )));
+        }
+        let quantity = book.net.abs();
+        order_legs.push(crate::LegFill {
+            venue: order.order.venue,
+            side: order.order.side,
+            notional_usdt: quantity * price,
+            average_price: price,
+            fee_usdt: order.fee_usdt,
+            client_order_id: order.order.client_order_id.clone(),
+            margin_usdt: None,
+        });
+    }
+    for (venue, side) in [(long_venue, Side::Buy), (short_venue, Side::Sell)] {
+        if order_legs.iter().any(|leg| leg.side == side) {
+            continue;
+        }
+        let Some(book) = books.get(&venue) else {
+            continue;
+        };
+        if book.net.is_zero() {
+            continue;
+        }
+        let price = book
+            .average
+            .filter(|price| *price > Decimal::ZERO)
+            .unwrap_or_default();
+        if price <= Decimal::ZERO {
+            return Ok(OpeningRestore::Held(format!(
+                "{venue} 已经有持仓，但没有均价，没有补记"
+            )));
+        }
+        let quantity = book.net.abs();
+        order_legs.push(crate::LegFill {
+            venue,
+            side,
+            notional_usdt: quantity * price,
+            average_price: price,
+            fee_usdt: Decimal::ZERO,
+            client_order_id: crate::types::ClientOrderId::for_leg(&position.id, side, 0),
+            margin_usdt: None,
+        });
+    }
+    if order_legs
+        .iter()
+        .filter(|leg| leg.side == Side::Buy)
+        .count()
+        > 1
+        || order_legs
+            .iter()
+            .filter(|leg| leg.side == Side::Sell)
+            .count()
+            > 1
+    {
+        return Ok(OpeningRestore::Held(
+            "同一方向有多条成交腿，收不进一笔仓位，没有补记".into(),
+        ));
     }
 
     let mut written = Vec::new();
@@ -1175,13 +1346,39 @@ pub async fn restore_opening_from_venues(
     }
 
     if written.is_empty() {
-        if open_orders.is_empty() {
-            return Ok(OpeningRestore::Flat);
+        if !open_orders.is_empty() {
+            return Ok(OpeningRestore::Held(format!(
+                "交易所这个合约已经没有持仓，但还有挂单（{}），不能按已平仓补记",
+                open_orders.join("、")
+            )));
         }
-        return Ok(OpeningRestore::Held(format!(
-            "交易所这个合约已经没有持仓，但还有挂单（{}），不能按已平仓补记",
-            open_orders.join("、")
-        )));
+        if one_recorded {
+            return Ok(OpeningRestore::Held(
+                "两边交易所这个合约都没有持仓。只记下的那条腿等对账再确认一次后，按人工外部处理结束"
+                    .into(),
+            ));
+        }
+        if orders_of(&replayed, position).is_empty() {
+            return Ok(OpeningRestore::Held(
+                "还没有开仓订单，两边这个合约也都没有仓，没有按已平仓结束".into(),
+            ));
+        }
+        return Ok(OpeningRestore::Flat);
+    }
+    if one_recorded && written.len() == 1 {
+        let existing = position.long.as_ref().or(position.short.as_ref());
+        if let Some(existing) = existing
+            && written[0].venue == existing.venue
+            && written[0].side == existing.side
+            && crate::reconcile::quantities_match(
+                existing.quantity().unwrap_or_default(),
+                written[0].quantity().unwrap_or_default(),
+            )
+        {
+            return Ok(OpeningRestore::Held(
+                "只记下的那条腿还在，另一边没有仓：这是裸敞口，不会自动平".into(),
+            ));
+        }
     }
 
     let mut restored = position.clone();
@@ -1271,6 +1468,8 @@ const MANUAL_EXTERNAL: &str = "人工外部处理";
 /// - 上一次对账（至少 [`EXTERNAL_CLOSE_CONFIRM`] 之前）也是这样。
 ///
 /// 一条腿没了、另一条还在，是裸敞口：**不**自动平剩下那条，只提示。
+/// 台账里只记下一条腿、这条在交易所也没了，并且这个合约没有别的仓和挂单时，
+/// 同样再确认一次后按人工外部处理结束。
 /// 开仓中断、台账没记下腿、但订单有成交的，账户归零后按人工外部处理结束（见
 /// [`opening_ids_with_unrecorded_fills`]）。
 /// `seen` 记着每笔候选第一次被发现的时刻；不再是候选的会被清掉。
@@ -1345,6 +1544,50 @@ pub fn check_external_closes_with(
             } else {
                 check.notes.push(note(
                     "台账没记下腿，交易所这个合约也已经没有仓（像是手动平掉了）：再对账确认一次（约 1 分钟）就按人工外部处理结束它，并按开平仓成交记录核算盈亏"
+                        .into(),
+                ));
+            }
+            continue;
+        }
+        if position.status == PositionStatus::Open && legs.len() == 1 {
+            let leg = legs[0];
+            let missing = reconciliation.divergences.iter().any(|d| {
+                d.kind == Kind::PositionMissingOnVenue
+                    && d.venue == Some(leg.venue)
+                    && d.reference == symbol
+            });
+            if !missing {
+                continue;
+            }
+            let leftover = reconciliation.divergences.iter().any(|d| {
+                (d.kind == Kind::PositionMismatch && d.reference == symbol)
+                    || (d.kind == Kind::UnknownOpenOrder
+                        && (d.venue == Some(leg.venue) || d.detail.contains(&symbol)))
+                    || (d.kind == Kind::OrderMissingOnVenue && d.venue == Some(leg.venue))
+            });
+            let unverified = reconciliation
+                .divergences
+                .iter()
+                .any(|d| d.kind == Kind::Unverified);
+            if leftover {
+                check.notes.push(note(
+                    "只记下一条腿，但这个合约在交易所还有仓或挂单：不能按人工外部处理结束".into(),
+                ));
+                continue;
+            }
+            if unverified {
+                check.notes.push(note(
+                    "只记下一条腿，且有场所没核对完：暂不按人工外部处理结束".into(),
+                ));
+                continue;
+            }
+            candidates.insert(position.id.clone());
+            let first = *seen.entry(position.id.clone()).or_insert(now);
+            if now.duration_since(first) >= EXTERNAL_CLOSE_CONFIRM {
+                check.adopt.push(position.id.clone());
+            } else {
+                check.notes.push(note(
+                    "只记下一条腿，交易所这个合约也已经没有仓和挂单（像是手动平掉了）：再对账确认一次（约 1 分钟）就按人工外部处理结束，并按成交记录核算盈亏"
                         .into(),
                 ));
             }
@@ -1467,6 +1710,7 @@ pub async fn adopt_external_closes(
         let orphan = position.status == PositionStatus::Opening
             && position.long.is_none()
             && position.short.is_none();
+        let one_recorded = !orphan && position.long.is_some() != position.short.is_some();
         // 腿在下面会被清掉：先把开仓记录存下来，事后按成交核算实际盈亏要用。
         if position.entry_legs.is_none() {
             position.entry_legs = position
@@ -1491,7 +1735,7 @@ pub async fn adopt_external_closes(
         // 开仓中断只成一条腿的，按实际有过仓的场所查（可以是一家）。
         let venues = crate::executor::position_venues(ledger, &position).await?;
         let now = chrono::Utc::now();
-        let funding = if orphan {
+        let funding = if orphan || one_recorded {
             crate::executor::funding_window_any(
                 brokers,
                 &venues,
@@ -1524,6 +1768,11 @@ pub async fn adopt_external_closes(
         position.note = Some(if orphan {
             format!(
                 "{MANUAL_EXTERNAL}：开仓中断、台账没记下腿，已在对应交易所核对开平仓（{} 对账确认账户已归零）。实际盈亏稍后按交易所成交记录核算；开仓以来资金费{funding_text}",
+                now.format("%Y-%m-%d %H:%M UTC"),
+            )
+        } else if one_recorded {
+            format!(
+                "{MANUAL_EXTERNAL}：只记下一条腿，对账确认这个合约在相关场所已经没有仓和挂单（{}）。实际盈亏稍后按交易所成交记录核算；开仓以来资金费{funding_text}",
                 now.format("%Y-%m-%d %H:%M UTC"),
             )
         } else {
@@ -2092,13 +2341,22 @@ pub async fn settle_closed_from_fills(
     settled.realized_funding_usdt = funding;
     settled.realized_source = Some(crate::RealizedSource::VenueFills);
     settled.pnl_unattributed = None;
-    let orphan = position
+    let manual = position
         .note
         .as_deref()
         .is_some_and(|note| note.starts_with(MANUAL_EXTERNAL));
-    settled.note = Some(if orphan {
+    let unrecorded = position
+        .note
+        .as_deref()
+        .is_some_and(|note| note.contains("没记下腿"));
+    settled.note = Some(if manual && unrecorded {
         format!(
             "{MANUAL_EXTERNAL}：开仓中断、台账没记下腿，已在对应交易所核对开平仓（{}）；{described}",
+            until.format("%Y-%m-%d %H:%M UTC"),
+        )
+    } else if manual {
+        format!(
+            "{MANUAL_EXTERNAL}：只记下一条腿，已在对应交易所核对开平仓（{}）；{described}",
             until.format("%Y-%m-%d %H:%M UTC"),
         )
     } else if position.is_external_close() {
@@ -3491,6 +3749,8 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                planned_long: None,
+                planned_short: None,
                 origin: None,
             }
         }
@@ -3740,6 +4000,8 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                planned_long: None,
+                planned_short: None,
                 origin: None,
             }
         }
@@ -3873,6 +4135,54 @@ mod tests {
                 &mut seen,
                 start + EXTERNAL_CLOSE_CONFIRM,
                 &filled,
+            );
+            assert_eq!(second.adopt, vec!["ext-1".to_string()]);
+        }
+
+        #[test]
+        fn a_single_recorded_leg_is_adopted_once_that_symbol_is_flat() {
+            let mut position = position(PositionStatus::Open);
+            position.short = None;
+            let mut seen = HashMap::new();
+            let start = Instant::now();
+            let divergences = vec![divergence(
+                Kind::PositionMissingOnVenue,
+                Venue::LighterRh,
+                "PONS/USDT",
+            )];
+            let first = check_external_closes(
+                &reconciliation(divergences.clone()),
+                &[&position],
+                &mut seen,
+                start,
+            );
+            assert!(first.adopt.is_empty());
+            assert!(first.notes[0].message.contains("只记下一条腿"));
+            let blocked = check_external_closes(
+                &reconciliation(vec![
+                    divergence(Kind::PositionMissingOnVenue, Venue::LighterRh, "PONS/USDT"),
+                    divergence(Kind::PositionMismatch, Venue::Arcus, "PONS/USDT"),
+                ]),
+                &[&position],
+                &mut HashMap::new(),
+                start + EXTERNAL_CLOSE_CONFIRM,
+            );
+            assert!(blocked.adopt.is_empty(), "另一边还有仓时不能结束");
+            let unverified = check_external_closes(
+                &reconciliation(vec![
+                    divergence(Kind::PositionMissingOnVenue, Venue::LighterRh, "PONS/USDT"),
+                    divergence(Kind::Unverified, Venue::Arcus, "arcus"),
+                ]),
+                &[&position],
+                &mut HashMap::new(),
+                start + EXTERNAL_CLOSE_CONFIRM,
+            );
+            assert!(unverified.adopt.is_empty(), "没核对完不能结束");
+            let second = check_external_closes(
+                &reconciliation(divergences),
+                &[&position],
+                &mut seen,
+                start + EXTERNAL_CLOSE_CONFIRM,
             );
             assert_eq!(second.adopt, vec!["ext-1".to_string()]);
         }
@@ -4293,6 +4603,8 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                planned_long: None,
+                planned_short: None,
                 origin: None,
             }
         }
@@ -5552,6 +5864,8 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                planned_long: None,
+                planned_short: None,
                 origin: None,
             }
         }
@@ -5909,6 +6223,8 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                planned_long: None,
+                planned_short: None,
                 origin: None,
             }
         }
@@ -6429,6 +6745,8 @@ mod tests {
                 entry_legs: None,
                 pnl_unattributed: None,
                 open_report: None,
+                planned_long: Some(Venue::LighterRh),
+                planned_short: Some(Venue::Arcus),
                 origin: None,
             }
         }
@@ -6598,7 +6916,10 @@ mod tests {
             .await;
             let outcome = restore_opening_from_venues(
                 &ledger,
-                &brokers(vec![book(Venue::LighterRh, dec!(4), dec!(2))]),
+                &brokers(vec![
+                    book(Venue::LighterRh, dec!(4), dec!(2)),
+                    book(Venue::Arcus, Decimal::ZERO, dec!(3)),
+                ]),
                 &position,
             )
             .await
@@ -6628,7 +6949,10 @@ mod tests {
             .await;
             let outcome = restore_opening_from_venues(
                 &ledger,
-                &brokers(vec![book(Venue::LighterRh, Decimal::ZERO, dec!(2))]),
+                &brokers(vec![
+                    book(Venue::LighterRh, Decimal::ZERO, dec!(2)),
+                    book(Venue::Arcus, Decimal::ZERO, dec!(3)),
+                ]),
                 &position,
             )
             .await
@@ -6662,7 +6986,11 @@ mod tests {
                 dec!(2),
             ));
             venue.orders[0].status = OrderStatus::Open;
-            let outcome = restore_opening_from_venues(&ledger, &brokers(vec![venue]), &position)
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![venue, book(Venue::Arcus, Decimal::ZERO, dec!(3))]),
+                &position,
+            )
                 .await
                 .unwrap();
             let OpeningRestore::Held(reason) = outcome else {
@@ -6687,7 +7015,11 @@ mod tests {
             .await;
             let mut venue = book(Venue::LighterRh, dec!(10), dec!(2));
             venue.fail_positions = true;
-            let outcome = restore_opening_from_venues(&ledger, &brokers(vec![venue]), &position)
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![venue, book(Venue::Arcus, Decimal::ZERO, dec!(3))]),
+                &position,
+            )
                 .await
                 .unwrap();
             let OpeningRestore::Held(reason) = outcome else {
@@ -6714,7 +7046,10 @@ mod tests {
             .await;
             let outcome = restore_opening_from_venues(
                 &ledger,
-                &brokers(vec![book(Venue::LighterRh, dec!(-10), dec!(2))]),
+                &brokers(vec![
+                    book(Venue::LighterRh, dec!(-10), dec!(2)),
+                    book(Venue::Arcus, Decimal::ZERO, dec!(3)),
+                ]),
                 &position,
             )
             .await
@@ -6786,6 +7121,250 @@ mod tests {
             .await
             .unwrap();
             assert!(matches!(outcome, OpeningRestore::Flat));
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn an_unfilled_order_is_recorded_when_that_venue_already_has_a_position() {
+            let position = opening();
+            let (ledger, path, position) = ledger_with(
+                "both-live",
+                vec![
+                    filled(&position, Side::Buy, Venue::LighterRh, dec!(10), dec!(2)),
+                    resting(&position, Side::Sell, Venue::Arcus),
+                ],
+            )
+            .await;
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![
+                    book(Venue::LighterRh, dec!(10), dec!(2)),
+                    book(Venue::Arcus, dec!(-8), dec!(3)),
+                ]),
+                &position,
+            )
+            .await
+            .unwrap();
+            let OpeningRestore::Restored(restored) = outcome else {
+                panic!("两边都有仓时要把没记下成交的那条补上");
+            };
+            assert!(restored.is_hedged(), "{:?}", restored.note);
+            assert_eq!(restored.short.unwrap().quantity(), Some(dec!(8)));
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn a_recorded_single_leg_gains_the_other_when_that_venue_has_a_position() {
+            let position = opening();
+            let (ledger, path, mut position) = ledger_with(
+                "add-short",
+                vec![
+                    filled(&position, Side::Buy, Venue::LighterRh, dec!(10), dec!(2)),
+                    resting(&position, Side::Sell, Venue::Arcus),
+                ],
+            )
+            .await;
+            position.status = PositionStatus::Open;
+            position.long = Some(crate::LegFill {
+                venue: Venue::LighterRh,
+                side: Side::Buy,
+                notional_usdt: dec!(20),
+                average_price: dec!(2),
+                fee_usdt: dec!(1),
+                client_order_id: ClientOrderId::for_leg(&position.id, Side::Buy, 0),
+                margin_usdt: Some(dec!(5)),
+            });
+            ledger
+                .append(&Record::Position(Box::new(position.clone())))
+                .await
+                .unwrap();
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![
+                    book(Venue::LighterRh, dec!(10), dec!(2)),
+                    book(Venue::Arcus, dec!(-8), dec!(3)),
+                ]),
+                &position,
+            )
+            .await
+            .unwrap();
+            let OpeningRestore::Restored(restored) = outcome else {
+                panic!("已经记下一条腿后，另一边有仓也要补上");
+            };
+            assert!(restored.is_hedged());
+            assert_eq!(restored.short.as_ref().unwrap().quantity(), Some(dec!(8)));
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn a_recorded_single_leg_is_not_closed_here_when_both_venues_are_flat() {
+            let position = opening();
+            let (ledger, path, mut position) = ledger_with(
+                "one-flat",
+                vec![filled(
+                    &position,
+                    Side::Buy,
+                    Venue::LighterRh,
+                    dec!(10),
+                    dec!(2),
+                )],
+            )
+            .await;
+            position.status = PositionStatus::Open;
+            position.long = Some(crate::LegFill {
+                venue: Venue::LighterRh,
+                side: Side::Buy,
+                notional_usdt: dec!(20),
+                average_price: dec!(2),
+                fee_usdt: dec!(1),
+                client_order_id: ClientOrderId::for_leg(&position.id, Side::Buy, 0),
+                margin_usdt: Some(dec!(5)),
+            });
+            ledger
+                .append(&Record::Position(Box::new(position.clone())))
+                .await
+                .unwrap();
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![
+                    book(Venue::LighterRh, Decimal::ZERO, dec!(2)),
+                    book(Venue::Arcus, Decimal::ZERO, dec!(3)),
+                ]),
+                &position,
+            )
+            .await
+            .unwrap();
+            let OpeningRestore::Held(reason) = outcome else {
+                panic!("只记下一条腿且两边归零时，核实不直接结束");
+            };
+            assert!(reason.contains("对账再确认"), "{reason}");
+            let (replayed, _) = ledger.replay().await.unwrap();
+            assert_eq!(replayed.positions["live-1"].status, PositionStatus::Open);
+            assert!(replayed.positions["live-1"].long.is_some());
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn a_recorded_single_leg_checks_the_other_planned_venue_again() {
+            let position = opening();
+            let (ledger, path, mut position) = ledger_with(
+                "recheck",
+                vec![filled(
+                    &position,
+                    Side::Buy,
+                    Venue::LighterRh,
+                    dec!(10),
+                    dec!(2),
+                )],
+            )
+            .await;
+            position.status = PositionStatus::Open;
+            position.long = Some(crate::LegFill {
+                venue: Venue::LighterRh,
+                side: Side::Buy,
+                notional_usdt: dec!(20),
+                average_price: dec!(2),
+                fee_usdt: dec!(1),
+                client_order_id: ClientOrderId::for_leg(&position.id, Side::Buy, 0),
+                margin_usdt: Some(dec!(5)),
+            });
+            ledger
+                .append(&Record::Position(Box::new(position.clone())))
+                .await
+                .unwrap();
+            let mut other = book(Venue::Arcus, Decimal::ZERO, dec!(3));
+            other.fail_positions = true;
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![book(Venue::LighterRh, dec!(10), dec!(2)), other]),
+                &position,
+            )
+            .await
+            .unwrap();
+            let OpeningRestore::Held(reason) = outcome else {
+                panic!("已经记下一条腿时，也不能跳过另一家");
+            };
+            assert!(reason.contains("没查成"), "{reason}");
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn a_missing_leg_is_taken_from_the_planned_venue_even_without_an_order() {
+            let position = opening();
+            let (ledger, path, mut position) = ledger_with(
+                "plan-short",
+                vec![filled(
+                    &position,
+                    Side::Buy,
+                    Venue::LighterRh,
+                    dec!(10),
+                    dec!(2),
+                )],
+            )
+            .await;
+            position.status = PositionStatus::Open;
+            position.long = Some(crate::LegFill {
+                venue: Venue::LighterRh,
+                side: Side::Buy,
+                notional_usdt: dec!(20),
+                average_price: dec!(2),
+                fee_usdt: dec!(1),
+                client_order_id: ClientOrderId::for_leg(&position.id, Side::Buy, 0),
+                margin_usdt: Some(dec!(5)),
+            });
+            ledger
+                .append(&Record::Position(Box::new(position.clone())))
+                .await
+                .unwrap();
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![
+                    book(Venue::LighterRh, dec!(10), dec!(2)),
+                    book(Venue::Arcus, dec!(-8), dec!(3)),
+                ]),
+                &position,
+            )
+            .await
+            .unwrap();
+            let OpeningRestore::Restored(restored) = outcome else {
+                panic!("另一家已经有仓，就要补上漏掉的那条腿");
+            };
+            assert!(restored.is_hedged(), "{:?}", restored.note);
+            assert_eq!(restored.long.as_ref().unwrap().quantity(), Some(dec!(10)));
+            assert_eq!(restored.short.as_ref().unwrap().quantity(), Some(dec!(8)));
+            assert_eq!(restored.short.as_ref().unwrap().venue, Venue::Arcus);
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+
+        #[tokio::test]
+        async fn an_unknown_second_venue_is_not_treated_as_flat() {
+            let (ledger, path, mut position) = ledger_with(
+                "unknown-short",
+                vec![filled(
+                    &opening(),
+                    Side::Buy,
+                    Venue::LighterRh,
+                    dec!(10),
+                    dec!(2),
+                )],
+            )
+            .await;
+            position.planned_long = None;
+            position.planned_short = None;
+            let outcome = restore_opening_from_venues(
+                &ledger,
+                &brokers(vec![book(Venue::LighterRh, Decimal::ZERO, dec!(2))]),
+                &position,
+            )
+            .await
+            .unwrap();
+            let OpeningRestore::Held(reason) = outcome else {
+                panic!("不知道另一家时，不能把这一家归零当成两边都平了");
+            };
+            assert!(reason.contains("没有记全"), "{reason}");
+            let (replayed, _) = ledger.replay().await.unwrap();
+            assert_eq!(replayed.positions["live-1"].status, PositionStatus::Opening);
+            assert!(replayed.positions["live-1"].long.is_none());
             let _ = tokio::fs::remove_file(&path).await;
         }
 

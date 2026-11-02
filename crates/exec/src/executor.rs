@@ -312,6 +312,8 @@ impl Executor {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned_long: Some(plan.long.venue),
+            planned_short: Some(plan.short.venue),
             origin: setup.origin.clone(),
         };
         self.persist(&position).await?;
@@ -1584,6 +1586,8 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned_long: None,
+            planned_short: None,
             origin: None,
         };
         executor.close(&mut position).await.unwrap();
@@ -1641,6 +1645,8 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned_long: None,
+            planned_short: None,
             origin: None,
         };
 
@@ -1738,6 +1744,8 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned_long: None,
+            planned_short: None,
             origin: None,
         };
 
@@ -1934,6 +1942,8 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned_long: None,
+            planned_short: None,
             origin: None,
         };
 
@@ -2495,6 +2505,8 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned_long: None,
+            planned_short: None,
             origin: None,
         }
     }

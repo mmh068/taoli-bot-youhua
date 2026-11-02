@@ -1208,8 +1208,11 @@ impl LiveDesk {
 
     /// 手动核实之后补记不完整仓位。
     ///
-    /// 开仓中断、订单已有成交、台账没记下腿的：到这笔订单对应的交易所查持仓。
-    /// 还有仓就按交易所的净持仓把腿补上；相关场所都已归零、也没有挂单，才按人工外部处理结束并核算盈亏。
+    /// 待核实名单里还没补成对冲的仓位，每次都查这笔计划的两家交易所，按现在的真实持仓补记，不下单。
+    /// 已经只写下一条腿的，下次仍查两边，不跳过。两家都有仓且方向一致，就按交易所净持仓补成对冲。
+    /// 只有一家有仓、另一家没有仓也没有挂单，就只补还在的那一条，标成裸敞口，不自动平。
+    /// 两条腿都还没写下、相关场所都已归零且没有挂单，才在这里按人工外部处理结束。
+    /// 已经写下一条腿后又两边归零的，留给每轮对账确认后再结束。
     /// 已结束但没有盈亏来源的，按订单终态能确定的情况补上；对不上或订单还没终态的只说明。
     async fn backfill_incomplete_on_verify(
         &self,
@@ -1221,16 +1224,30 @@ impl LiveDesk {
         let (replayed, _) = self.ledger.replay().await?;
         let _ = arb_exec::verify_queue::refresh(self.ledger.path(), &replayed, only);
         let exposed = replayed.exposed();
-        let filled_openings: Vec<String> = desk::opening_ids_with_unrecorded_fills(&replayed)
-            .into_iter()
-            .filter(|id| only.contains(id))
+        let repair: Vec<String> = only
+            .iter()
+            .filter(|id| {
+                let Some(position) = replayed.positions.get(*id) else {
+                    return false;
+                };
+                match position.status {
+                    arb_exec::PositionStatus::Opening => {
+                        position.long.is_none() || position.short.is_none()
+                    }
+                    arb_exec::PositionStatus::Open => {
+                        position.long.is_some() != position.short.is_some()
+                    }
+                    _ => false,
+                }
+            })
+            .cloned()
             .collect();
-        if filled_openings.is_empty() {
+        if repair.is_empty() {
             lines.extend(self.backfill_unsettled_ended(only).await?);
             return Ok(lines);
         }
         let mut adopt = Vec::new();
-        for id in &filled_openings {
+        for id in &repair {
             let Some(position) = replayed.positions.get(id) else {
                 continue;
             };
@@ -4597,6 +4614,8 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned_long: None,
+            planned_short: None,
             origin: None,
         }
     }

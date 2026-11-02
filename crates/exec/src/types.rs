@@ -429,6 +429,12 @@ pub struct PairPosition {
     /// 谁开的。旧台账没有这个字段，显示为自动。手动信号开的标成 `manual`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+    /// 开仓计划的多头场所。手动核实按这一家和空头那一家的真实持仓补记。旧台账没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_long: Option<Venue>,
+    /// 开仓计划的空头场所。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planned_short: Option<Venue>,
 }
 
 /// 已实现盈亏的出处。
@@ -605,6 +611,8 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned_long: None,
+            planned_short: None,
             origin: None,
         };
         assert!(position.is_naked(), "两腿都没成交也是裸敞口");
@@ -663,6 +671,8 @@ mod tests {
             entry_legs: None,
             pnl_unattributed: None,
             open_report: None,
+            planned_long: None,
+            planned_short: None,
             origin: None,
         };
         // 基差收敛到 0 → 赚 1%
