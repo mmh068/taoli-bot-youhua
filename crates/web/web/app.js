@@ -3180,7 +3180,7 @@ function rhAutoHtml(a, cfg) {
       <span class="small muted">${esc(data.status || '')}</span>
     </div>
     ${data.disabled_reason && !on ? `<div class="notice error">上次自动关闭的原因：${esc(data.disabled_reason)}</div>` : ''}
-    <p class="small muted">所有你配了 API 的交易所两两组成的组都参与（实盘：两家都已连接）。任何一组的信号「回到正常净收益」达到门槛、且开仓可成交价差与收敛到 0 净收益都为正、连续保持够久后，按下面的参数自动下一笔价差单。资金费核算默认关闭；选择 1、4 或 8 小时后，这段时间要付的资金费不低于已经扣过手续费的预估净收益的不合格。每一笔都走和手动下单同一套检查：对账干净、按你的金额现拉盘口重算、单笔上限${maxSize ? `（${esc(String(maxSize))} USDT）` : ''}、持仓数上限、当日亏损、Telegram /pause 与熔断。同一合约已有仓位不再开；每次尝试后该合约冷却 10 分钟；执行中断（结果未知）或连续 ${data.max_failures} 次回滚会自动关闭。</p>
+    <p class="small muted">所有你配了 API 的交易所两两组成的组都参与（实盘：两家都已连接）。任何一组的信号「回到正常净利润」达到门槛、且开仓可成交价差与收敛到 0 净收益都为正、连续保持够久后，按下面的参数自动下一笔价差单。资金费不计入这笔净利润。资金费核算默认关闭；选择 1、4 或 8 小时后，还要求回到正常净利润加上这段时间的资金费高于配置门槛（默认高于 0%）才合格。每一笔都走和手动下单同一套检查：对账干净、按你的金额现拉盘口重算、单笔上限${maxSize ? `（${esc(String(maxSize))} USDT）` : ''}、持仓数上限、当日亏损、Telegram /pause 与熔断。同一合约已有仓位不再开；每次尝试后该合约冷却 10 分钟；执行中断（结果未知）或连续 ${data.max_failures} 次回滚会自动关闭。</p>
     <div class="rh-auto-grid">
       <label class="field"><span>账户</span><select data-rh-auto="mode">
         <option value="paper"${f.mode === 'paper' ? ' selected' : ''}>纸面（不碰真实资金）</option>
@@ -3188,7 +3188,7 @@ function rhAutoHtml(a, cfg) {
       </select></label>
       ${RH_AUTO_FIELDS.map(field).join('')}
       <label class="field" title="逗号分隔，如 NVDA,SPY；留空 = 全部合约"><span>只做这些合约</span><input type="text" data-rh-auto="symbols" value="${esc(f.symbols)}" placeholder="全部" /></label>
-      <label class="field" title="默认关闭。开启后，开仓后这段时间要付的资金费，不低于已经扣过手续费的回到正常预估净收益的不合格"><span>资金费核算</span><select data-rh-auto="funding_check_hours">
+      <label class="field" title="默认关闭。开启后按这里选的 1、4 或 8 小时核算。回到正常净利润不含资金费，先过上面的门槛，再加上这段资金费，不高于配置值不合格"><span>资金费核算</span><select data-rh-auto="funding_check_hours">
         <option value=""${f.funding_check_hours === '' ? ' selected' : ''}>关闭</option>
         <option value="1"${f.funding_check_hours === '1' ? ' selected' : ''}>开仓后 1 小时</option>
         <option value="4"${f.funding_check_hours === '4' ? ' selected' : ''}>开仓后 4 小时</option>

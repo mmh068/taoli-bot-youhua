@@ -10,7 +10,7 @@
 //! - 自动开的仓位同时最多 `max_positions` 笔，每个 UTC 日最多 `daily_max_opens` 笔；
 //! - 每次尝试后该合约冷却；两次开仓之间至少隔 [`MIN_OPEN_GAP`]；
 //! - 必须至少带一条退出规则（回到正常基差平仓 / 止盈）：没有退出条件的自动仓位只会一直挂着；
-//! - 资金费核算默认关闭。开启后，开仓后 1、4 或 8 小时要付的资金费（空腿收、多腿付）加上往返手续费，大于等于回到正常的预估利润时不合格，不进入下单检查；
+//! - 资金费核算默认关闭。开启后，回到正常净利润不含资金费，先要达到面板门槛；再按面板选定的 1、4 或 8 小时把资金费加回去，合计不高于配置值就不合格，不进入下单检查；
 //! - 执行中断（结果未知）立刻关闭自动交易；回滚没完成、仓位仍在 `unwinding` 也立刻关闭，
 //!   不计入连续回滚次数；开仓连续以回滚收场 [`MAX_FAILURES`] 次也关闭。
 //!
@@ -401,13 +401,11 @@ pub fn candidate_of_with(
     {
         return None;
     }
-    // 预估利润已经扣过往返手续费。只在开启核算时，再看这段时间还要付的资金费。
-    // 要付的资金费不低于这笔净收益就不合格。净收取不算成成本，费率对不上也不猜。
+    // 回到正常净利润不含资金费，上面已经和面板门槛比过。
+    // 开启核算时再加面板选定小时数的资金费，收为正、付为负。不高于配置值不合格。费率对不上不猜。
     if let Some(hours) = settings.funding_check_hours {
-        let paid = funding_carry_pct(report?, &line.base, long, short, hours)?
-            .min(Decimal::ZERO)
-            .abs();
-        if paid >= net {
+        let carry = funding_carry_pct(report?, &line.base, long, short, hours)?;
+        if !crate::opportunity_log::net_plus_funding_clears(net, carry) {
             return None;
         }
     }
@@ -447,8 +445,8 @@ fn funding_carry_pct(
     Some(((short_cost - long_cost) * Decimal::ONE_HUNDRED).round_dp(5))
 }
 
-/// 资金费核算开着时才用。还要付的资金费不低于已扣手续费的净收益就不做。
-/// 没有快照或两条腿对不上当前费率时不猜。
+/// 资金费核算开着时才用。回到正常净利润不含资金费，再加上这段时间的资金费。
+/// 和不高于配置值就不做。没有快照或两条腿对不上当前费率时不猜。
 pub fn ensure_funding_allows(
     report: Option<&arb_scanner::ScanReport>,
     base: &str,
@@ -463,12 +461,15 @@ pub fn ensure_funding_allows(
     let Some(carry) = funding_carry_pct(report, base, long, short, hours) else {
         return Err("两条腿的资金费对不上当前快照，这次不开仓".into());
     };
-    let paid = carry.min(Decimal::ZERO).abs();
-    if paid >= profit_pct {
+    if !crate::opportunity_log::net_plus_funding_clears(profit_pct, carry) {
+        let sum = (profit_pct + carry).round_dp(4);
+        let floor = crate::opportunity_log::net_plus_funding_min_pct();
         return Err(format!(
-            "开仓后 {hours} 小时要付的资金费 {}% 不低于预估净收益 {}%，这次不开仓",
-            paid.normalize(),
-            profit_pct.normalize()
+            "开仓后 {hours} 小时：回到正常净利润 {}% + 资金费 {}% = {}%，不高于门槛 {}%，这次不开仓",
+            profit_pct.normalize(),
+            carry.normalize(),
+            sum.normalize(),
+            floor.normalize()
         ));
     }
     Ok(())
@@ -940,7 +941,10 @@ impl AutoTrader {
                     "监控中：没有回到正常净收益 ≥ {}%{}的信号",
                     settings.min_net_pct.normalize(),
                     settings.funding_check_hours.map_or(String::new(), |hours| {
-                        format!("、且开仓后 {hours} 小时要付的资金费仍小于预估净收益")
+                        format!(
+                            "、且开仓后 {hours} 小时的回到正常净利润加资金费仍高于 {}%",
+                            crate::opportunity_log::net_plus_funding_min_pct().normalize()
+                        )
                     })
                 );
                 return;
@@ -1554,7 +1558,7 @@ mod tests {
     fn an_eight_hour_funding_cost_that_covers_the_profit_is_not_a_candidate() {
         let row = line("NVDA", "long_a", leg("0.30", "0.20", "0.09"), -0.11);
         // long_a：多 Arcus、空 Lighter RH。多腿每小时付 0.01%，空腿不收：8 小时付 0.08%。
-        // 0.09% 的净收益已经扣过 0.045% 手续费，不再把手续费加第二次。0.08% 还没盖过 0.09%。
+        // 回到正常净利润 0.09% 不含资金费。0.09% + (-0.08%) 仍高于 0。
         let report = funding_report(
             "NVDA",
             Venue::Arcus,
@@ -1569,7 +1573,7 @@ mod tests {
         checking.funding_check_hours = Some(8);
         assert!(
             candidate_of_with(&row, &checking, Some(&report)).is_some(),
-            "8 小时只付 0.08%，低于已扣手续费的 0.09% 净收益，funding={funding:?}"
+            "8 小时付 0.08%，净利润 0.09% 加资金费后仍高于 0，funding={funding:?}"
         );
         let costly = funding_report(
             "NVDA",
@@ -1582,7 +1586,13 @@ mod tests {
         );
         assert!(
             candidate_of_with(&row, &checking, Some(&costly)).is_none(),
-            "8 小时要付 0.16%，不低于 0.09% 净收益"
+            "8 小时付 0.16%，净利润 0.09% 加资金费后不高于 0"
+        );
+        let mut one_hour = checking.clone();
+        one_hour.funding_check_hours = Some(1);
+        assert!(
+            candidate_of_with(&row, &one_hour, Some(&costly)).is_some(),
+            "同一费率按面板的 1 小时只付 0.02%，净利润加资金费后仍高于 0"
         );
         assert!(
             candidate_of_with(&row, &settings(), Some(&report)).is_some(),

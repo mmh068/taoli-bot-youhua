@@ -256,6 +256,7 @@ async fn main() -> anyhow::Result<()> {
                     spread.basis_pct,
                     &spread.session_label,
                     spread.net_to_normal_pct,
+                    spread.funding_pct,
                 );
                 let telegram_sent = telegram::push_open_button(&text, &code).await;
                 let discord_sent = state.alerts.notify_discord(text);
@@ -853,7 +854,7 @@ async fn open_manual_signal(state: &Arc<AppState>, code: &str) -> Result<String,
         None
     };
     // 手动开仓的资金费固定看未来 8 小时，不读自动面板上的 1 / 4 / 8 小时。
-    // 净收益里已经加过这笔资金费，这里去掉后再比，避免要付的钱算两次。
+    // 回到正常净利润不含资金费。这里用当时快照的 8 小时资金费加回去，和预检同一条比较。
     let profit = opportunity_log::manual_basis_net(&base, long, short)
         .ok_or("这组机会没有预估净收益，不能按 8 小时资金费核算开仓")?;
     let report = state
