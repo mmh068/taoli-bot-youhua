@@ -1691,13 +1691,17 @@ impl Journal {
                 by_cloid.insert(item.cloid.clone(), item);
             }
         }
-        // Persist a newly-created file and its directory before any future reservation.
+        // Persist a newly-created file before any future reservation.
+        // Directory-entry durability is POSIX-only: Windows rejects opening a directory.
         file.sync_all()?;
-        let parent = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        File::open(parent)?.sync_all()?;
+        #[cfg(unix)]
+        {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            File::open(parent)?.sync_all()?;
+        }
         Ok(Self {
             file,
             by_cloid,
@@ -2547,10 +2551,10 @@ fn match_historical_order<'a>(
     oid: Option<u64>,
     cloid: &str,
 ) -> Option<&'a RemoteStatus> {
-    if let Some(oid) = oid {
-        if let Some(row) = rows.iter().find(|row| row.order.oid == oid) {
-            return Some(row);
-        }
+    if let Some(oid) = oid
+        && let Some(row) = rows.iter().find(|row| row.order.oid == oid)
+    {
+        return Some(row);
     }
     rows.iter()
         .find(|row| row.order.cloid.as_deref() == Some(cloid))
@@ -2894,7 +2898,7 @@ mod tests {
 
     #[test]
     fn reservation_survives_restart_and_prevents_ambiguous_resubmission() {
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::scratch_dir().join(format!(
             "arb-hyperliquid-journal-{}-{}.jsonl",
             std::process::id(),
             next_nonce().unwrap()
@@ -2928,7 +2932,7 @@ mod tests {
 
     #[test]
     fn remembered_oid_survives_restart_and_rejects_a_different_oid() {
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::scratch_dir().join(format!(
             "arb-hyperliquid-oid-journal-{}-{}.jsonl",
             std::process::id(),
             next_nonce().unwrap()
@@ -2958,7 +2962,7 @@ mod tests {
 
     #[test]
     fn explicit_reject_without_oid_is_a_zero_fill_and_survives_restart() {
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::scratch_dir().join(format!(
             "arb-hyperliquid-reject-journal-{}-{}.jsonl",
             std::process::id(),
             next_nonce().unwrap()
@@ -3021,7 +3025,7 @@ mod tests {
 
     #[test]
     fn verified_terminal_is_reused_without_another_query_and_rejects_a_different_one() {
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::scratch_dir().join(format!(
             "arb-hyperliquid-terminal-journal-{}-{}.jsonl",
             std::process::id(),
             next_nonce().unwrap()
@@ -3322,7 +3326,7 @@ mod tests {
 
     #[test]
     fn journal_identity_pins_the_dex() {
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::scratch_dir().join(format!(
             "arb-hyperliquid-dex-journal-{}-{}.jsonl",
             std::process::id(),
             next_nonce().unwrap()
@@ -3440,13 +3444,13 @@ mod tests {
         let public = signer.verifying_key().to_encoded_point(false);
         let signer_address = hex(&keccak(&public.as_bytes()[1..])[12..]);
         let account = hex(&[0x11; 20]);
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::scratch_dir().join(format!(
             "arb-hyperliquid-margin-journal-{}-{}.jsonl",
             std::process::id(),
             next_nonce().unwrap()
         ));
         let journal = Journal::open(&path, &account, &signer_address, dex.venue()).unwrap();
-        std::fs::remove_file(&path).unwrap();
+        // 文件还开着时不能删：Windows 会拒绝。目录由测试临时目录在线程结束时清掉。
         HyperliquidBroker {
             client: Client::builder()
                 .timeout(timeout)

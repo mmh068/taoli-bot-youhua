@@ -220,6 +220,7 @@ impl Alerter {
         Self::with_sinks(sinks)
     }
 
+    #[cfg(test)]
     pub fn with_sink(sink: Option<Arc<dyn Sink>>) -> Arc<Self> {
         match sink {
             Some(sink) => Self::with_sinks(vec![sink]),
@@ -285,6 +286,7 @@ impl Alerter {
         self.notify_on(self.sink.as_ref(), Instant::now(), "", text.into(), true)
     }
 
+    #[cfg(test)]
     fn notify_at(&self, now: Instant, key: &str, text: String) -> bool {
         self.notify_on(self.sink.as_ref(), now, key, text, false)
     }

@@ -183,18 +183,18 @@ impl CumulativePnl {
     /// 有文件就读；没有就按当前回放引导并尽量落盘。持仓页 / 台账页等同步路径用。
     pub fn load_or_bootstrap_from_replay(ledger_path: &Path, replayed: &Replayed) -> Self {
         let path = Self::path_for(ledger_path);
-        if path.exists() {
-            if let Ok(mut value) = Self::load_sync(&path) {
-                let mut changed = value.note_times(replayed);
-                changed |= value.upgrade_symbol_rollup(replayed);
-                changed |= value.upgrade_manual(replayed);
-                changed |= value.seal_unwound_if_complete(replayed);
-                changed |= value.prune_tracked_ids(Utc::now());
-                if changed {
-                    let _ = value.save_sync(&path);
-                }
-                return value;
+        if path.exists()
+            && let Ok(mut value) = Self::load_sync(&path)
+        {
+            let mut changed = value.note_times(replayed);
+            changed |= value.upgrade_symbol_rollup(replayed);
+            changed |= value.upgrade_manual(replayed);
+            changed |= value.seal_unwound_if_complete(replayed);
+            changed |= value.prune_tracked_ids(Utc::now());
+            if changed {
+                let _ = value.save_sync(&path);
             }
+            return value;
         }
         let mut value = Self::bootstrap_from_replay(replayed);
         let mut changed = value.note_times(replayed);
@@ -386,11 +386,11 @@ impl CumulativePnl {
         let delta = actual - old;
         self.net_usdt = (self.net_usdt + delta).round_dp(8);
         self.funding_usdt = (self.funding_usdt + delta).round_dp(8);
-        if let Some(symbol) = self.symbol_of.get(position_id).cloned() {
-            if let Some(row) = self.symbols.get_mut(&symbol) {
-                row.net_usdt = (row.net_usdt + delta).round_dp(8);
-                row.funding_usdt = (row.funding_usdt + delta).round_dp(8);
-            }
+        if let Some(symbol) = self.symbol_of.get(position_id).cloned()
+            && let Some(row) = self.symbols.get_mut(&symbol)
+        {
+            row.net_usdt = (row.net_usdt + delta).round_dp(8);
+            row.funding_usdt = (row.funding_usdt + delta).round_dp(8);
         }
         if self.manual_ids.contains(position_id) {
             self.manual_net_usdt = (self.manual_net_usdt + delta).round_dp(8);

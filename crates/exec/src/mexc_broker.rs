@@ -1478,8 +1478,8 @@ mod tests {
 
     /// 独立临时订单日志：每个测试用不同文件名，避免并行运行时互抢 fs2 独占锁。
     fn test_journal(tag: &str) -> (OrderJournal, std::path::PathBuf) {
-        let path =
-            std::env::temp_dir().join(format!("arb-mexc-test-{tag}-{}.jsonl", std::process::id()));
+        let path = crate::test_scratch::scratch_dir()
+            .join(format!("arb-mexc-test-{tag}-{}.jsonl", std::process::id()));
         let _ = std::fs::remove_file(&path);
         (OrderJournal::open(&path, "mexc:test").unwrap(), path)
     }

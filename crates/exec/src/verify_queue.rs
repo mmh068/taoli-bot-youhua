@@ -320,7 +320,8 @@ mod tests {
 
     #[test]
     fn the_queue_seeds_once_then_only_tracks_writes_and_dirty_positions() {
-        let dir = std::env::temp_dir().join(format!("needs-verify-{}", std::process::id()));
+        let dir =
+            crate::test_scratch::scratch_dir().join(format!("needs-verify-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let ledger = dir.join("arb-live-ledger.jsonl");

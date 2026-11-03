@@ -100,7 +100,7 @@ pub struct Settings {
     pub max_positions: usize,
     /// 每个 UTC 日最多自动开几笔。
     pub daily_max_opens: usize,
-    /// 只做这些合约（base，大写）；空 = 全部。
+    /// 不做这些合约（base，大写）；空 = 不排除。
     #[serde(default)]
     pub symbols: Vec<String>,
     /// 开仓后资金费核算小时。`None` 关闭；只允许 1、4 或 8。
@@ -207,7 +207,7 @@ impl Settings {
                 s.is_empty() || s.len() > 20 || !s.chars().all(|c| c.is_ascii_alphanumeric())
             })
         {
-            return Err("合约名单只能是字母数字，逗号分隔".into());
+            return Err("排除合约只能是字母数字，逗号分隔".into());
         }
         if self
             .funding_check_hours
@@ -288,6 +288,7 @@ pub fn target_for(direction: &str, median: f64) -> Option<Decimal> {
 
 /// 更新「达到门槛」的连续计时：只保留这一刻仍达标的（合约, 方向），返回各自已保持的秒数。
 /// 用自己的门槛计时，不用监控的提醒信号 —— 用户的门槛可能低于提醒门槛。
+#[cfg(test)]
 pub fn track_holds(
     view: &View,
     settings: &Settings,
@@ -317,6 +318,7 @@ pub fn track_holds_with(
 
 /// 从价差监控的快照里挑一笔。`Err` 是这一刻为什么不下单（给页面看）。
 /// `tradable`：这家场所能不能下单（实盘：已连接；纸面：都能）。两条腿都要能下单的组才做。
+#[cfg(test)]
 pub fn pick(
     view: &View,
     settings: &Settings,
@@ -355,7 +357,7 @@ pub fn pick_with(
             continue;
         }
         candidate.signal_sec = held_sec(&candidate);
-        if !settings.symbols.is_empty() && !settings.symbols.contains(&candidate.base) {
+        if settings.symbols.iter().any(|s| s == &candidate.base) {
             continue;
         }
         if candidate.signal_sec < settings.hold_sec {
@@ -377,6 +379,7 @@ pub fn pick_with(
 }
 
 /// 一行能不能做、怎么做。没有扫描快照时不算资金费，只给不碰行情的测试用。
+#[cfg(test)]
 pub fn candidate_of(line: &Line, settings: &Settings) -> Option<Candidate> {
     candidate_of_with(line, settings, None)
 }
@@ -881,7 +884,9 @@ impl AutoTrader {
             .await
             .map(|snapshot| snapshot.report.clone());
         let now = Utc::now();
-        // 先记符合开仓条件的币，再决定这一轮下不下单。暂停、只读、没连上也不漏记。
+        // 这一轮只筛一次。快照、参数和扫描结果在这一轮里不变，再筛不会增减达标信号。
+        // 起点记在开头：后面因为限额、间隔而不下单时，计时也已经更新，限额解除后不会拿旧起点当「已保持很久」。
+        // 决策时用当时的时刻减这个起点，不缩短已保持的秒数。暂停、只读、没连上也不漏记。
         let held_for_log = {
             let mut inner = self.inner.lock().await;
             track_holds_with(
@@ -973,14 +978,6 @@ impl AutoTrader {
                 .iter()
                 .filter(|o| o.mode == mode && exposed.iter().any(|(id, _)| id == &o.id))
                 .count();
-            // 计时每秒都更新（哪怕这一刻因为限额不下单），免得限额解除时拿旧的起点当「已保持很久」。
-            track_holds_with(
-                &view,
-                &settings,
-                report.as_ref(),
-                &mut inner.since,
-                Instant::now(),
-            );
             if open_auto >= settings.max_positions {
                 inner.status = format!(
                     "自动仓位已到上限（{open_auto}/{}），等平仓",
@@ -1000,7 +997,6 @@ impl AutoTrader {
                 return;
             }
             let instant = Instant::now();
-            track_holds_with(&view, &settings, report.as_ref(), &mut inner.since, instant);
             let since = inner.since.clone();
             let held = |c: &Candidate| {
                 since
@@ -1083,16 +1079,17 @@ impl AutoTrader {
             ..arb_exec::TaskRules::default()
         };
         let symbol = format!("{}/USDT", candidate.base);
-        let body = crate::trade::manual_open_body(
-            settings.mode,
-            &symbol,
-            candidate.long,
-            candidate.short,
-            settings.size_usdt,
-            settings.leverage,
-            arb_exec::MarginMode::Isolated,
-            &rules,
-        );
+        let body = crate::trade::open_body(crate::trade::OpenSpec {
+            mode: settings.mode,
+            symbol: &symbol,
+            long: candidate.long,
+            short: candidate.short,
+            size: settings.size_usdt,
+            leverage: settings.leverage,
+            margin_mode: arb_exec::MarginMode::Isolated,
+            rules: &rules,
+            origin: Some("manual"),
+        });
         let label = format!(
             "{} 多 {} / 空 {}",
             candidate.base,
@@ -1156,16 +1153,17 @@ impl AutoTrader {
             ..arb_exec::TaskRules::default()
         };
         let symbol = format!("{}/USDT", candidate.base);
-        let body = crate::trade::auto_open_body(
-            settings.mode,
-            &symbol,
-            candidate.long,
-            candidate.short,
-            settings.size_usdt,
-            settings.leverage,
-            arb_exec::MarginMode::Isolated,
-            &rules,
-        );
+        let body = crate::trade::open_body(crate::trade::OpenSpec {
+            mode: settings.mode,
+            symbol: &symbol,
+            long: candidate.long,
+            short: candidate.short,
+            size: settings.size_usdt,
+            leverage: settings.leverage,
+            margin_mode: arb_exec::MarginMode::Isolated,
+            rules: &rules,
+            origin: None,
+        });
         let mode = if settings.mode == Mode::Live {
             "实盘"
         } else {
@@ -1328,7 +1326,7 @@ pub fn describe(settings: &Settings) -> String {
         settings.max_positions, settings.daily_max_opens
     ));
     if !settings.symbols.is_empty() {
-        parts.push(format!("只做 {}", settings.symbols.join(",")));
+        parts.push(format!("不做 {}", settings.symbols.join(",")));
     }
     parts.push(match settings.funding_check_hours {
         Some(hours) => format!("开仓后 {hours} 小时资金费核算"),
@@ -1685,13 +1683,15 @@ mod tests {
         // 已有 NVDA 仓位：跳到下一条。
         let busy = |b: &str| (b == "NVDA").then(|| "已有这个合约的仓位".to_string());
         assert_eq!(pick(&v, &s, now, &all, &held, &busy).unwrap().base, "SPY");
-        // 名单只做 SPY。
-        let only = Settings {
-            symbols: vec!["SPY".into()],
+        // 名单里的合约不做：排除 NVDA 后选 SPY。
+        let excluded = Settings {
+            symbols: vec!["NVDA".into()],
             ..s.clone()
         };
         assert_eq!(
-            pick(&v, &only, now, &all, &held, &none).unwrap().base,
+            pick(&v, &excluded, now, &all, &held, &none)
+                .unwrap()
+                .base,
             "SPY"
         );
         // 行情断了、快照旧了：不下单。
@@ -1921,16 +1921,17 @@ mod tests {
             take_profit_usdt: Some(dec("1.50")),
             ..arb_exec::TaskRules::default()
         };
-        let body = crate::trade::auto_open_body(
-            Mode::Live,
-            "NVDA/USDT",
-            Venue::Arcus,
-            Venue::LighterRh,
-            Decimal::from(500),
-            Decimal::from(3),
-            arb_exec::MarginMode::Isolated,
-            &rules,
-        );
+        let body = crate::trade::open_body(crate::trade::OpenSpec {
+            mode: Mode::Live,
+            symbol: "NVDA/USDT",
+            long: Venue::Arcus,
+            short: Venue::LighterRh,
+            size: Decimal::from(500),
+            leverage: Decimal::from(3),
+            margin_mode: arb_exec::MarginMode::Isolated,
+            rules: &rules,
+            origin: None,
+        });
         let text = format!("{body:?}");
         for part in [
             "Live",

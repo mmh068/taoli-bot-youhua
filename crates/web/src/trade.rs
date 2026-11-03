@@ -1277,12 +1277,11 @@ impl LiveDesk {
         self.backfill_external_pnl().await;
         let (after, _) = self.ledger.replay().await?;
         for position in &adopted {
-            if let Some(settled) = after.positions.get(&position.id) {
-                if settled.realized_source.is_some() {
-                    if let Some(note) = settled.note.as_deref() {
-                        lines.push(format!("[{}] {note}", settled.id));
-                    }
-                }
+            if let Some(settled) = after.positions.get(&position.id)
+                && settled.realized_source.is_some()
+                && let Some(note) = settled.note.as_deref()
+            {
+                lines.push(format!("[{}] {note}", settled.id));
             }
         }
         lines.extend(self.backfill_unsettled_ended(only).await?);
@@ -1886,9 +1885,7 @@ impl Trade {
     /// 自动交易能不能开新仓。名单里还有待核实仓位，或最近一次对账不干净，就先停。
     /// 还没对过账时不在这里拦，开仓自己会先对账。
     pub(crate) async fn live_auto_open_hold(&self) -> Option<String> {
-        let Some(live) = self.live_opt() else {
-            return None;
-        };
+        let live = self.live_opt()?;
         let pending = arb_exec::verify_queue::position_ids(live.ledger.path()).map(|ids| ids.len());
         let mark = live.last_reconcile.read().await;
         let divergences = mark.as_ref().map(|mark| match &mark.outcome {
@@ -3152,65 +3149,43 @@ pub async fn api_trade_daily(State(state): State<Arc<AppState>>, headers: Header
 
 /// 自动交易（RH 价差）用的开仓请求：与页面下单同一个结构、同一条路径（[`run_open`]），
 /// 所以对账、闸门、当日亏损、熔断、暂停开仓、二次确认、Telegram 通知一个不少。
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn manual_open_body(
-    mode: Mode,
-    symbol: &str,
-    long: Venue,
-    short: Venue,
-    size: Decimal,
-    leverage: Decimal,
-    margin_mode: arb_exec::MarginMode,
-    rules: &TaskRules,
-) -> OpenBody {
-    let mut body = auto_open_body(
-        mode,
-        symbol,
-        long,
-        short,
-        size,
-        leverage,
-        margin_mode,
-        rules,
-    );
-    body.origin = Some("manual".into());
-    body
+pub(crate) struct OpenSpec<'a> {
+    pub mode: Mode,
+    pub symbol: &'a str,
+    pub long: Venue,
+    pub short: Venue,
+    pub size: Decimal,
+    pub leverage: Decimal,
+    pub margin_mode: arb_exec::MarginMode,
+    pub rules: &'a TaskRules,
+    pub origin: Option<&'a str>,
 }
 
-pub(crate) fn auto_open_body(
-    mode: Mode,
-    symbol: &str,
-    long: Venue,
-    short: Venue,
-    size: Decimal,
-    leverage: Decimal,
-    margin_mode: arb_exec::MarginMode,
-    rules: &TaskRules,
-) -> OpenBody {
+pub(crate) fn open_body(spec: OpenSpec<'_>) -> OpenBody {
     let opt = |value: Option<Decimal>| value.map(|v| v.normalize().to_string());
     OpenBody {
-        margin_mode,
-        mode,
-        symbol: symbol.to_string(),
-        long: long.as_str().to_string(),
-        short: short.as_str().to_string(),
-        size: size.normalize().to_string(),
-        leverage: leverage.normalize().to_string(),
+        margin_mode: spec.margin_mode,
+        mode: spec.mode,
+        symbol: spec.symbol.to_string(),
+        long: spec.long.as_str().to_string(),
+        short: spec.short.as_str().to_string(),
+        size: spec.size.normalize().to_string(),
+        leverage: spec.leverage.normalize().to_string(),
         // 留空：实盘用台账算出来的当日已实现盈亏（算不出就拒绝，不按 0 算）。
         daily_pnl: None,
         view: Some("spread".into()),
         rules: RuleFields {
             min_funding_apr: None,
-            liq_protection: opt(rules.liq_protection_pct),
-            size_mismatch: opt(rules.size_mismatch_pct),
-            basis_exit: opt(rules.basis_exit_pct),
-            take_profit: opt(rules.take_profit_usdt),
-            auto_margin: opt(rules.auto_margin_pct),
-            auto_margin_max: opt(rules.auto_margin_max_usdt),
+            liq_protection: opt(spec.rules.liq_protection_pct),
+            size_mismatch: opt(spec.rules.size_mismatch_pct),
+            basis_exit: opt(spec.rules.basis_exit_pct),
+            take_profit: opt(spec.rules.take_profit_usdt),
+            auto_margin: opt(spec.rules.auto_margin_pct),
+            auto_margin_max: opt(spec.rules.auto_margin_max_usdt),
         },
         // 自动交易是用户在面板上显式开启的；这里照样走二次确认那道检查（填合约名）。
-        confirm: symbol.split('/').next().map(str::to_string),
-        origin: None,
+        confirm: spec.symbol.split('/').next().map(str::to_string),
+        origin: spec.origin.map(str::to_string),
     }
 }
 
@@ -4173,7 +4148,7 @@ mod tests {
             position.short.as_ref().unwrap(),
             &report.symbols[0].rates[1],
         );
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::scratch_dir().join(format!(
             "arb-web-rules-{}-{}.jsonl",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap()
@@ -4438,7 +4413,7 @@ mod tests {
     #[tokio::test]
     async fn immediately_firing_rule_edits_require_confirmation_without_touching_the_ledger() {
         let (report, position) = rules_fixture();
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::scratch_dir().join(format!(
             "arb-rule-confirm-{}-{}.jsonl",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap(),

@@ -1087,11 +1087,11 @@ impl Prechecker {
             let base = symbol.split('/').next().unwrap_or(symbol.as_str());
             crate::opportunity_log::drop_active(base, long, short);
         }
-        if !fresh.is_empty() {
-            if let Some(sender) = &self.on_manual_pass {
-                for key in fresh {
-                    let _ = sender.try_send(key);
-                }
+        if !fresh.is_empty()
+            && let Some(sender) = &self.on_manual_pass
+        {
+            for key in fresh {
+                let _ = sender.try_send(key);
             }
         }
         true

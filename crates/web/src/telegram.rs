@@ -418,22 +418,6 @@ pub fn parse_command(text: &str) -> Option<(String, String)> {
 
 // ───────────────────────────── 长轮询主循环 ─────────────────────────────
 
-/// 给管理员私聊发一条带「立即开仓」按钮的消息。点按钮等于发送 `/open 代码`。
-pub async fn notify_open_button(bot: &Bot, text: &str, code: &str) {
-    let button_data = format!("open {code}");
-    if button_data.len() > 64 {
-        return;
-    }
-    bot.deliver(
-        bot.admin,
-        Reply {
-            text: text.to_string(),
-            keyboard: vec![vec![button("立即开仓", &button_data)]],
-        },
-    )
-    .await;
-}
-
 /// 长轮询等待多久（秒）。HTTP 超时要比它长。
 const POLL_SECONDS: u64 = 25;
 /// 有界只读并发，避免反复点击放大交易所账户接口请求。

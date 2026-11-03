@@ -17,6 +17,17 @@ use arb_exec::settlement::VenueFill;
 use arb_exec::{Ledger, PairPosition, PositionStatus};
 use chrono::Duration;
 
+fn scratch_dir() -> std::path::PathBuf {
+    use std::cell::RefCell;
+    thread_local! {
+        static DIRS: RefCell<Vec<tempfile::TempDir>> = const { RefCell::new(Vec::new()) };
+    }
+    let dir = tempfile::tempdir().expect("创建测试临时目录");
+    let path = dir.path().to_path_buf();
+    DIRS.with(|dirs| dirs.borrow_mut().push(dir));
+    path
+}
+
 fn d(value: Decimal) -> String {
     format!("{:>9}", value.round_dp(4).to_string())
 }
@@ -53,7 +64,7 @@ async fn audit_closed_positions_against_venue_records() {
         set
     };
     let source_dir = ledger_path.parent().map(PathBuf::from).unwrap_or_default();
-    let temp = std::env::temp_dir().join(format!("pnl-audit-{}", std::process::id()));
+    let temp = scratch_dir().join(format!("pnl-audit-{}", std::process::id()));
     std::fs::create_dir_all(&temp).unwrap();
     for venue in &venues {
         let from = arb_exec::live_connect::journal_path(&source_dir, *venue);
@@ -284,7 +295,7 @@ async fn rehearse_funding_corrections_on_a_copy() {
     let source = PathBuf::from(
         std::env::var("ARB_AUDIT_LEDGER").unwrap_or_else(|_| "../../arb-live-ledger.jsonl".into()),
     );
-    let temp = std::env::temp_dir().join(format!("pnl-rehearse-{}", std::process::id()));
+    let temp = scratch_dir().join(format!("pnl-rehearse-{}", std::process::id()));
     std::fs::create_dir_all(&temp).unwrap();
     let copy = temp.join("ledger.jsonl");
     std::fs::copy(&source, &copy).unwrap();

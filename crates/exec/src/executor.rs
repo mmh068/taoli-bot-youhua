@@ -1425,8 +1425,8 @@ mod tests {
     /// place 当时失败（明细未齐/超时），短重试查单后才看到成交：应记成成交，且 place 只调用一次。
     #[tokio::test]
     async fn short_confirm_retries_lookup_without_resubmitting_place() {
-        let path =
-            std::env::temp_dir().join(format!("arb-confirm-retry-{}.jsonl", std::process::id()));
+        let path = crate::test_scratch::scratch_dir()
+            .join(format!("arb-confirm-retry-{}.jsonl", std::process::id()));
         let _ = tokio::fs::remove_file(&path).await;
         let ledger = Arc::new(Ledger::open(&path).await.unwrap());
 
@@ -1525,7 +1525,8 @@ mod tests {
     /// 备注里写开、平仓两次的成交价差（0.1137% → 0.1961%）。
     #[tokio::test]
     async fn closing_records_realized_pnl_from_the_actual_fills() {
-        let path = std::env::temp_dir().join(format!("arb-realized-{}.jsonl", std::process::id()));
+        let path = crate::test_scratch::scratch_dir()
+            .join(format!("arb-realized-{}.jsonl", std::process::id()));
         let _ = tokio::fs::remove_file(&path).await;
         let ledger = Arc::new(Ledger::open(&path).await.unwrap());
         let fill = |venue, price, fee| {
@@ -1611,7 +1612,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_partial_exit_stays_closing_and_the_retry_closes_only_the_remainder() {
-        let path = std::env::temp_dir().join(format!("arb-exit-{}.jsonl", std::process::id()));
+        let path = crate::test_scratch::scratch_dir()
+            .join(format!("arb-exit-{}.jsonl", std::process::id()));
         let _ = tokio::fs::remove_file(&path).await;
         let ledger = Arc::new(Ledger::open(&path).await.unwrap());
         let broker = Arc::new(PartialThenFullBroker {
@@ -1674,7 +1676,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_protection_trim_lands_exactly_on_the_target_distance() {
-        let dir = std::env::temp_dir().join(format!("arb-trim-{}", std::process::id()));
+        let dir =
+            crate::test_scratch::scratch_dir().join(format!("arb-trim-{}", std::process::id()));
         let path = dir.join("ledger.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
         let ledger = Arc::new(Ledger::open(&path).await.unwrap());
@@ -1897,7 +1900,8 @@ mod tests {
     /// 复用旧号时券商要么拒绝，要么（查询返回旧成交）让执行器把旧成交再记一遍账。
     #[tokio::test]
     async fn a_retry_after_an_incomplete_trim_uses_fresh_order_ids() {
-        let dir = std::env::temp_dir().join(format!("arb-trim-retry-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir()
+            .join(format!("arb-trim-retry-{}", std::process::id()));
         let path = dir.join("ledger.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
         let ledger = Arc::new(Ledger::open(&path).await.unwrap());
@@ -2129,7 +2133,8 @@ mod tests {
     }
 
     async fn temp_ledger(name: &str) -> Arc<Ledger> {
-        let path = std::env::temp_dir().join(format!("arb-{name}-{}.jsonl", std::process::id()));
+        let path = crate::test_scratch::scratch_dir()
+            .join(format!("arb-{name}-{}.jsonl", std::process::id()));
         let _ = tokio::fs::remove_file(&path).await;
         Arc::new(Ledger::open(&path).await.unwrap())
     }

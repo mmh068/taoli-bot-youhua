@@ -2710,7 +2710,7 @@ mod tests {
 
     #[test]
     fn journal_replays_each_deployment_and_refuses_the_other_chain() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::scratch_dir().join(format!(
             "arb-lighter-deployments-{}-{}",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap()
@@ -3132,7 +3132,7 @@ mod tests {
     }
     async fn rig(account: i64, enabled: bool, routes: Vec<(&'static str, Vec<Reply>)>) -> Rig {
         let server = fake_lighter(routes).await;
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::scratch_dir().join(format!(
             "arb-lighter-margin-{}-{account}",
             std::process::id()
         ));
@@ -3791,7 +3791,7 @@ mod tests {
 
     #[test]
     fn released_nonce_reservations_replay_and_mismatched_releases_are_rejected() {
-        let dir = std::env::temp_dir().join(format!(
+        let dir = crate::test_scratch::scratch_dir().join(format!(
             "arb-lighter-release-{}-{}",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap()

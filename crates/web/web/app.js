@@ -3187,7 +3187,7 @@ function rhAutoHtml(a, cfg) {
         <option value="live"${f.mode === 'live' ? ' selected' : ''}>实盘（真实资金）</option>
       </select></label>
       ${RH_AUTO_FIELDS.map(field).join('')}
-      <label class="field" title="逗号分隔，如 NVDA,SPY；留空 = 全部合约"><span>只做这些合约</span><input type="text" data-rh-auto="symbols" value="${esc(f.symbols)}" placeholder="全部" /></label>
+      <label class="field" title="逗号分隔，如 NVDA,SPY；留空 = 不排除；填了的合约不会自动开仓"><span>不做这些合约</span><input type="text" data-rh-auto="symbols" value="${esc(f.symbols)}" placeholder="不排除" /></label>
       <label class="field" title="默认关闭。开启后按这里选的 1、4 或 8 小时核算。回到正常净利润不含资金费，先过上面的门槛，再加上这段资金费，不高于配置值不合格"><span>资金费核算</span><select data-rh-auto="funding_check_hours">
         <option value=""${f.funding_check_hours === '' ? ' selected' : ''}>关闭</option>
         <option value="1"${f.funding_check_hours === '1' ? ' selected' : ''}>开仓后 1 小时</option>

@@ -696,8 +696,10 @@ fn status_splits_auto_trading_open_and_close() {
         ]
     );
 
-    let mut paper = Settings::default();
-    paper.enabled = true;
+    let paper = Settings {
+        enabled: true,
+        ..Settings::default()
+    };
     assert_eq!(
         auto_trading_lines(&paper, None, None, 30),
         vec![
@@ -707,10 +709,12 @@ fn status_splits_auto_trading_open_and_close() {
         ]
     );
 
-    let mut live_settings = Settings::default();
-    live_settings.enabled = true;
-    live_settings.mode = Mode::Live;
-    live_settings.take_profit_usdt = Some(Decimal::from(12));
+    let live_settings = Settings {
+        enabled: true,
+        mode: Mode::Live,
+        take_profit_usdt: Some(Decimal::from(12)),
+        ..Settings::default()
+    };
     let paused = LiveHealth {
         mode: LiveMode::Trade,
         watch_sec: 60,

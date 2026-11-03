@@ -933,9 +933,7 @@ fn planned_venues(
     }
     match (long, short) {
         (Some(long), Some(short)) if long != short => Ok((long, short)),
-        (Some(venue), Some(_)) => {
-            Err(format!("这笔计划的两家都记成了 {venue}，不能按净持仓补记"))
-        }
+        (Some(venue), Some(_)) => Err(format!("这笔计划的两家都记成了 {venue}，不能按净持仓补记")),
         _ => Err("这笔计划的两家交易所没有记全，不能按两边的真实持仓补记".into()),
     }
 }
@@ -987,7 +985,7 @@ fn filled_open_legs(replayed: &Replayed, position: &PairPosition) -> Vec<crate::
 #[derive(Debug)]
 pub enum OpeningRestore {
     /// 已按交易所当前净持仓把腿写进台账。仓位仍有敞口。
-    Restored(PairPosition),
+    Restored(Box<PairPosition>),
     /// 这笔订单对应的场所上，这个合约已经没有仓，也没有挂单。
     Flat,
     /// 这次不能写。台账保持原样。
@@ -1433,7 +1431,7 @@ pub async fn restore_opening_from_venues(
         symbol = %restored.symbol,
         "手动核实按交易所持仓补记了没写下的腿"
     );
-    Ok(OpeningRestore::Restored(restored))
+    Ok(OpeningRestore::Restored(Box::new(restored)))
 }
 
 struct VenueSymbolBook {
@@ -2518,13 +2516,12 @@ pub async fn recheck_funding(
     ledger
         .append(&crate::Record::Position(Box::new(checked)))
         .await?;
-    if let FundingCheck::Corrected(previous, actual) = &outcome {
-        if let Err(error) =
+    if let FundingCheck::Corrected(previous, actual) = &outcome
+        && let Err(error) =
             crate::cumulative::sync_funding_correction(ledger, &position.id, *previous, *actual)
                 .await
-        {
-            warn!(position = %position.id, %error, "累计已实现盈亏存档资金费更正失败");
-        }
+    {
+        warn!(position = %position.id, %error, "累计已实现盈亏存档资金费更正失败");
     }
     Ok(outcome)
 }
@@ -3759,7 +3756,8 @@ mod tests {
         /// 的预估 → 不为正就持有、为正才交给执行器。
         #[tokio::test]
         async fn a_converged_position_is_checked_against_fresh_books_before_closing() {
-            let path = std::env::temp_dir().join(format!("arb-wired-{}.jsonl", std::process::id()));
+            let path = crate::test_scratch::scratch_dir()
+                .join(format!("arb-wired-{}.jsonl", std::process::id()));
             let _ = tokio::fs::remove_file(&path).await;
             let ledger = Arc::new(Ledger::open(&path).await.unwrap());
             // 没有券商：真要下单就会报错，正好用来证明走到了平仓这一步。
@@ -4340,8 +4338,8 @@ mod tests {
 
         #[tokio::test]
         async fn adopting_ends_the_position_in_the_ledger_and_the_next_reconcile_is_clean() {
-            let path =
-                std::env::temp_dir().join(format!("arb-external-{}.jsonl", std::process::id()));
+            let path = crate::test_scratch::scratch_dir()
+                .join(format!("arb-external-{}.jsonl", std::process::id()));
             let _ = tokio::fs::remove_file(&path).await;
             let ledger = Ledger::open(&path).await.unwrap();
             let open = position(PositionStatus::Open);
@@ -4398,8 +4396,8 @@ mod tests {
 
         #[tokio::test]
         async fn an_opening_without_legs_is_marked_manual_external() {
-            let path =
-                std::env::temp_dir().join(format!("arb-orphan-{}.jsonl", std::process::id()));
+            let path = crate::test_scratch::scratch_dir()
+                .join(format!("arb-orphan-{}.jsonl", std::process::id()));
             let _ = tokio::fs::remove_file(&path).await;
             let ledger = Ledger::open(&path).await.unwrap();
             let mut open = position(PositionStatus::Opening);
@@ -4705,7 +4703,7 @@ mod tests {
         }
 
         async fn ledger(name: &str) -> (Ledger, std::path::PathBuf) {
-            let path = std::env::temp_dir()
+            let path = crate::test_scratch::scratch_dir()
                 .join(format!("arb-settle-{name}-{}.jsonl", std::process::id()));
             let _ = tokio::fs::remove_file(&path).await;
             (Ledger::open(&path).await.unwrap(), path)
@@ -5692,8 +5690,8 @@ mod tests {
         }
 
         async fn temp_ledger(name: &str) -> Arc<Ledger> {
-            let path =
-                std::env::temp_dir().join(format!("arb-desk-{name}-{}.jsonl", std::process::id()));
+            let path = crate::test_scratch::scratch_dir()
+                .join(format!("arb-desk-{name}-{}.jsonl", std::process::id()));
             let _ = tokio::fs::remove_file(&path).await;
             Arc::new(Ledger::open(&path).await.unwrap())
         }
@@ -6246,7 +6244,7 @@ mod tests {
         }
 
         async fn temp_ledger(name: &str) -> Arc<Ledger> {
-            let path = std::env::temp_dir().join(format!(
+            let path = crate::test_scratch::scratch_dir().join(format!(
                 "arb-desk-rules-{name}-{}.jsonl",
                 std::process::id()
             ));
@@ -6781,7 +6779,7 @@ mod tests {
             name: &str,
             orders: Vec<OrderState>,
         ) -> (Ledger, std::path::PathBuf, PairPosition) {
-            let path = std::env::temp_dir()
+            let path = crate::test_scratch::scratch_dir()
                 .join(format!("arb-restore-{name}-{}.jsonl", std::process::id()));
             let _ = tokio::fs::remove_file(&path).await;
             let ledger = Ledger::open(&path).await.unwrap();
@@ -6991,8 +6989,8 @@ mod tests {
                 &brokers(vec![venue, book(Venue::Arcus, Decimal::ZERO, dec!(3))]),
                 &position,
             )
-                .await
-                .unwrap();
+            .await
+            .unwrap();
             let OpeningRestore::Held(reason) = outcome else {
                 panic!("空仓但仍有挂单时不能收成已平");
             };
@@ -7020,8 +7018,8 @@ mod tests {
                 &brokers(vec![venue, book(Venue::Arcus, Decimal::ZERO, dec!(3))]),
                 &position,
             )
-                .await
-                .unwrap();
+            .await
+            .unwrap();
             let OpeningRestore::Held(reason) = outcome else {
                 panic!("查失败时不能补记");
             };

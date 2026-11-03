@@ -470,12 +470,16 @@ impl OrderJournal {
             journal.append(&JournalRecord::Identity {
                 identity: identity.to_string(),
             })?;
-            // 新文件：连同目录项一起落盘，之后的意图才有意义。
-            let parent = path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(Path::new("."));
-            File::open(parent)?.sync_all()?;
+            // 新文件的目录项落盘只在 POSIX 上做。Windows 不能打开目录再 sync；
+            // 文件内容已经在 append 里 sync_all。生产环境是 Linux，行为不变。
+            #[cfg(unix)]
+            {
+                let parent = path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(Path::new("."));
+                File::open(parent)?.sync_all()?;
+            }
         }
         Ok(journal)
     }
@@ -748,7 +752,8 @@ mod tests {
 
     #[test]
     fn journal_survives_restart_and_refuses_other_accounts() {
-        let dir = std::env::temp_dir().join(format!("arb-journal-{}", std::process::id()));
+        let dir =
+            crate::test_scratch::scratch_dir().join(format!("arb-journal-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("orders.jsonl");
         let entry = JournalEntry {

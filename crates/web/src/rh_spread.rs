@@ -469,6 +469,7 @@ impl HeldBases {
 }
 
 impl Monitor {
+    #[cfg(test)]
     pub fn new(config: Config, alerts: Arc<Alerter>) -> Arc<Self> {
         Self::with_held(config, alerts, HeldBases::default())
     }

@@ -164,10 +164,10 @@ impl Ledger {
         let mut file = self.file.lock().await;
         file.write_all(line.as_bytes()).await?;
         file.sync_data().await?;
-        if let Record::Position(position) = record {
-            if let Err(error) = crate::verify_queue::note_position(self.path(), position) {
-                tracing::warn!(%error, "更新待核实仓位名单失败");
-            }
+        if let Record::Position(position) = record
+            && let Err(error) = crate::verify_queue::note_position(self.path(), position)
+        {
+            tracing::warn!(%error, "更新待核实仓位名单失败");
         }
         Ok(())
     }
@@ -301,16 +301,18 @@ fn stamp_orders(
     }
 }
 
+type PrunedSnapshot = (
+    HashMap<String, OrderState>,
+    HashMap<String, PairPosition>,
+    HashMap<String, DateTime<Utc>>,
+);
+
 /// 压实进快照的那一份。调用方手里的 [`Replayed`] 不动。
 fn prune_snapshot(
     replayed: &Replayed,
     order_at: &HashMap<String, DateTime<Utc>>,
     now: DateTime<Utc>,
-) -> (
-    HashMap<String, OrderState>,
-    HashMap<String, PairPosition>,
-    HashMap<String, DateTime<Utc>>,
-) {
+) -> PrunedSnapshot {
     let today = beijing_date(now);
     let recent: HashSet<String> = recent_ended_ids(&replayed.positions).into_iter().collect();
     let positions = replayed
@@ -660,7 +662,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_keeps_the_latest_state_per_key() {
-        let dir = std::env::temp_dir().join(format!("arb-ledger-{}", std::process::id()));
+        let dir =
+            crate::test_scratch::scratch_dir().join(format!("arb-ledger-{}", std::process::id()));
         let path = dir.join("ledger.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
         let ledger = Ledger::open(&path).await.unwrap();
@@ -693,7 +696,8 @@ mod tests {
     /// （坏行会让对账拒绝一切开仓与规则）。追加的后续记录不受牵连。
     #[tokio::test]
     async fn a_torn_tail_is_quarantined_not_sealed_into_a_permanent_bad_line() {
-        let dir = std::env::temp_dir().join(format!("arb-ledger-torn-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir()
+            .join(format!("arb-ledger-torn-{}", std::process::id()));
         let path = dir.join("ledger.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
         let _ = tokio::fs::remove_file(torn_path(&path)).await;
@@ -738,7 +742,8 @@ mod tests {
     /// 只缺换行的完整记录是一条真记录：保留，补上换行。
     #[tokio::test]
     async fn a_complete_record_missing_only_its_newline_is_kept() {
-        let dir = std::env::temp_dir().join(format!("arb-ledger-nl-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir()
+            .join(format!("arb-ledger-nl-{}", std::process::id()));
         let path = dir.join("ledger.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
         let line = serde_json::to_string(&Record::Order(Box::new(order("o1", dec!(100))))).unwrap();
@@ -760,7 +765,8 @@ mod tests {
     /// 文件中间的坏行（不是崩溃的尾巴）仍然只被计数：对账据此拒绝操作，由人核对。
     #[tokio::test]
     async fn a_corrupt_line_in_the_middle_is_counted_and_does_not_destroy_the_history() {
-        let dir = std::env::temp_dir().join(format!("arb-ledger-bad-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir()
+            .join(format!("arb-ledger-bad-{}", std::process::id()));
         let path = dir.join("ledger.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
         let ledger = Ledger::open(&path).await.unwrap();
@@ -790,7 +796,8 @@ mod tests {
 
     #[tokio::test]
     async fn only_positions_with_exposure_are_reported() {
-        let dir = std::env::temp_dir().join(format!("arb-ledger-exp-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir()
+            .join(format!("arb-ledger-exp-{}", std::process::id()));
         let path = dir.join("ledger.jsonl");
         let _ = tokio::fs::remove_file(&path).await;
         let ledger = Ledger::open(&path).await.unwrap();
@@ -830,7 +837,8 @@ mod tests {
     /// 一条仓位的全过程仍从原文件翻，所以快照不能代替历史。
     #[tokio::test]
     async fn snapshot_plus_tail_matches_a_full_replay_and_ignores_a_corrupt_prefix() {
-        let dir = std::env::temp_dir().join(format!("arb-ledger-snap-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir()
+            .join(format!("arb-ledger-snap-{}", std::process::id()));
         let path = dir.join("ledger.jsonl");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         let ledger = Ledger::open(&path).await.unwrap();
@@ -915,7 +923,8 @@ mod tests {
     /// 旧的已结算仓位和它名下超过 7 日的订单不进快照；未平仓、近 7 日的订单、仍挂着的单要留。
     #[tokio::test]
     async fn snapshot_keeps_recent_orders_and_drops_aged_out_history() {
-        let dir = std::env::temp_dir().join(format!("arb-ledger-keep-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir()
+            .join(format!("arb-ledger-keep-{}", std::process::id()));
         let path = dir.join("ledger.jsonl");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         let ledger = Ledger::open(&path).await.unwrap();

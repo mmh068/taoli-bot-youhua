@@ -207,7 +207,7 @@ mod tests {
     fn temp_path(label: &str) -> PathBuf {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        std::env::temp_dir().join(format!("arb-web-runstate-{label}-{n}.json"))
+        crate::test_scratch::scratch_dir().join(format!("arb-web-runstate-{label}-{n}.json"))
     }
 
     #[test]

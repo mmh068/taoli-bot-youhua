@@ -15,6 +15,17 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::json;
 
+fn scratch_dir() -> std::path::PathBuf {
+    use std::cell::RefCell;
+    thread_local! {
+        static DIRS: RefCell<Vec<tempfile::TempDir>> = const { RefCell::new(Vec::new()) };
+    }
+    let dir = tempfile::tempdir().expect("创建测试临时目录");
+    let path = dir.path().to_path_buf();
+    DIRS.with(|dirs| dirs.borrow_mut().push(dir));
+    path
+}
+
 fn legacy_position() -> PairPosition {
     let leg = |venue: &str, side: &str| {
         json!({
@@ -263,7 +274,7 @@ async fn fixture(
     Arc<Mutex<Events>>,
     std::path::PathBuf,
 ) {
-    let path = std::env::temp_dir().join(format!(
+    let path = scratch_dir().join(format!(
         "arb-mode-test-{}-{}.jsonl",
         std::process::id(),
         Utc::now().timestamp_nanos_opt().unwrap()

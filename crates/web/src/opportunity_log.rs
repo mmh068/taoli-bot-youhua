@@ -80,7 +80,8 @@ static NET_PLUS_FUNDING_MIN_PCT: LazyLock<Decimal> =
     LazyLock::new(configured_net_plus_funding_min_pct);
 
 /// 手动信号已连续出现的扫描轮数。中断或从榜上消失就清零。
-static MANUAL_ROUNDS: LazyLock<Mutex<HashMap<String, u32>>> =
+/// 按基差文件分开：页面扫描和测试各记各的，不能互相清掉。
+static MANUAL_ROUNDS: LazyLock<Mutex<HashMap<(String, String), u32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// 已经从活跃文件读入的手动机会。`None` 表示还没读过磁盘。
 static LATEST_MANUAL: LazyLock<Mutex<Option<Vec<Value>>>> = LazyLock::new(|| Mutex::new(None));
@@ -192,31 +193,25 @@ pub fn manual_push_text(
     short: &str,
     size: Decimal,
     leverage: Decimal,
-    entry_pct: Decimal,
-    normal_basis_pct: Decimal,
-    basis_pct: Decimal,
-    session: &str,
-    net_pct: Decimal,
-    funding_pct: Decimal,
+    spread: &ManualSpread,
 ) -> String {
-    let sum = net_pct + funding_pct;
-    let profit_usdt = (sum / Decimal::ONE_HUNDRED * size)
-        .round_dp(2)
-        .normalize();
+    let sum = spread.net_to_normal_pct + spread.funding_pct;
+    let profit_usdt = (sum / Decimal::ONE_HUNDRED * size).round_dp(2).normalize();
     let long_label = venue_name(long);
     let short_label = venue_name(short);
     format!(
         "手动机会已通过预检：{base} 多 {long_label} / 空 {short_label}，{} USDT × {}x\n可成交价差 {}%（{} USDT），{session}正常基差 {}%，当前 {}%（{short_label} − {long_label}）\n回到正常净利润 {}%（不含资金费，已扣手续费与平仓穿价）\n回到正常净利润 + 8 小时资金费 {}%（资金费 {}%，≈{profit_usdt} USDT）\n30 分钟内有效，用过即废。下单前仍重查，资金费固定按 8 小时，不看自动面板。",
         size.normalize(),
         leverage.normalize(),
-        entry_pct.round_dp(3).normalize(),
+        spread.entry_pct.round_dp(3).normalize(),
         size.normalize(),
-        normal_basis_pct.round_dp(3).normalize(),
-        basis_pct.round_dp(3).normalize(),
-        net_pct.round_dp(3).normalize(),
+        spread.normal_basis_pct.round_dp(3).normalize(),
+        spread.basis_pct.round_dp(3).normalize(),
+        spread.net_to_normal_pct.round_dp(3).normalize(),
         sum.round_dp(3).normalize(),
-        funding_pct.round_dp(3).normalize(),
+        spread.funding_pct.round_dp(3).normalize(),
         profit_usdt = profit_usdt,
+        session = spread.session_label,
     )
 }
 
@@ -328,7 +323,9 @@ pub fn basis_path(path: &Path) -> PathBuf {
         None => format!("{name}-basis"),
     };
     // Windows 短文件名和长文件名指向同一目录。不先规范化，基差样本和活跃机会会写到两条路径上。
-    let parent = path.parent().filter(|parent| !parent.as_os_str().is_empty());
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
     let parent = parent
         .and_then(|parent| std::fs::canonicalize(parent).ok())
         .unwrap_or_else(|| parent.unwrap_or(Path::new("")).to_path_buf());
@@ -344,7 +341,6 @@ pub fn basis_store_path() -> PathBuf {
     )
 }
 
-/// 最近一轮里某个手动机会的回到正常净收益（%）。没有或过期则为空。
 /// 最近一轮达标手动机会记下的正常基差（%，空腿减多腿）。
 pub fn paired_normal_basis_pct(base: &str, long: Venue, short: Venue) -> Option<Decimal> {
     qualifying_manual().into_iter().find_map(|row| {
@@ -352,14 +348,6 @@ pub fn paired_normal_basis_pct(base: &str, long: Venue, short: Venue) -> Option<
             return None;
         }
         row_pct(&row, "normal_basis_pct")
-    })
-}
-
-pub fn manual_net_to_normal(base: &str, long: Venue, short: Venue) -> Option<String> {
-    qualifying_manual().into_iter().find_map(|row| {
-        (row["base"] == base && row["long"] == long.as_str() && row["short"] == short.as_str())
-            .then(|| row["net_to_normal_pct"].as_str().map(str::to_string))
-            .flatten()
     })
 }
 
@@ -387,9 +375,7 @@ pub fn path_from_env() -> Option<PathBuf> {
 /// 机会文件开关。不写、空、`off`、`0`、`false` 都不记。
 /// `on`、`1`、`true` 写到当前目录的 `opportunity-log.jsonl`；其它值当作路径。
 fn path_from_setting(raw: Option<&str>) -> Option<PathBuf> {
-    let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return None;
-    };
+    let raw = raw.map(str::trim).filter(|raw| !raw.is_empty())?;
     match raw.to_ascii_lowercase().as_str() {
         "off" | "0" | "false" => None,
         "on" | "1" | "true" => Some(PathBuf::from(DEFAULT_PATH)),
@@ -429,14 +415,14 @@ fn record_at(path: Option<&Path>, basis: &Path, report: &ScanReport) {
         // 价差条件还在就续计轮次。没满两轮也写入，只是不进预检。
         still.insert(key.clone());
         entered.push(opportunity);
-        let rounds = manual_rounds(&key);
-        row["held_rounds"] = json!(rounds);
         row["hold_rounds"] = json!(MANUAL_HOLD_ROUNDS);
-        rows.push(row);
+        rows.push((key, row));
     }
-    if let Ok(mut seen) = MANUAL_ROUNDS.lock() {
-        seen.retain(|key, _| still.contains(key));
+    for (key, row) in &mut rows {
+        let rounds = note_rounds(basis, &still, key);
+        row["held_rounds"] = json!(rounds);
     }
+    let rows: Vec<Value> = rows.into_iter().map(|(_, row)| row).collect();
     publish_manual(basis, &rows, at);
     let keep_basis = match path {
         Some(path) => append(path, &rows),
@@ -457,7 +443,13 @@ fn publish_manual(basis: &Path, rows: &[Value], now: DateTime<Utc>) {
 }
 
 fn active_path_for(basis: &Path) -> PathBuf {
-    basis.with_file_name("manual-active.jsonl")
+    // 跟基差文件放在一起，文件名带上基差文件自己的名字。
+    // 否则同一目录里两份基差会抢同一个活跃文件。
+    let stem = basis
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("basis");
+    basis.with_file_name(format!("{stem}.manual-active.jsonl"))
 }
 
 fn active_store_path() -> PathBuf {
@@ -528,7 +520,7 @@ fn merge_active(existing: &[Value], incoming: &[Value], now: DateTime<Utc>) -> V
         }
     }
     let mut rows: Vec<Value> = out.into_values().collect();
-    rows.sort_by(|left, right| active_key(left).cmp(&active_key(right)));
+    rows.sort_by_key(active_key);
     rows
 }
 
@@ -580,7 +572,10 @@ fn store_active(path: &Path, rows: &[Value]) {
         text.push_str(&line);
         text.push('\n');
     }
-    let tmp = path.with_extension("tmp");
+    // 追加后缀，不换掉 .jsonl。换掉的话会和基差文件的临时名撞上，改名时把对方清空。
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
     if let Err(error) = std::fs::write(&tmp, text) {
         warn!(path = %path.display(), "手动机会活跃文件没写上：{error}");
         return;
@@ -590,11 +585,15 @@ fn store_active(path: &Path, rows: &[Value]) {
     }
 }
 
-fn manual_rounds(key: &str) -> u32 {
+/// 记下本轮还在榜上的，清掉消失的。只清这一份基差文件自己的计数，
+/// 不清别的扫描或测试正在计的。清零和加轮次在同一把锁里做。
+fn note_rounds(basis: &Path, still: &HashSet<String>, key: &str) -> u32 {
     let Ok(mut seen) = MANUAL_ROUNDS.lock() else {
         return 0;
     };
-    let rounds = seen.entry(key.to_string()).or_insert(0);
+    let lane = basis.display().to_string();
+    seen.retain(|(seen_lane, seen_key), _| seen_lane != &lane || still.contains(seen_key));
+    let rounds = seen.entry((lane, key.to_string())).or_insert(0);
     *rounds = rounds.saturating_add(1);
     *rounds
 }
@@ -703,22 +702,22 @@ pub fn record_monitor_signal(path: Option<&Path>, at: DateTime<Utc>, line: &Line
     if leg.quote.entry_pct <= Decimal::ZERO || leg.net_to_zero_pct <= Decimal::ZERO {
         return;
     }
-    let row = row(
+    let row = row(RowInput {
         at,
-        "auto",
-        &line.base,
-        "USDT",
+        kind: "auto",
+        base: &line.base,
+        quote: "USDT",
         long,
         short,
-        leg.quote.entry_pct,
-        net,
-        Some(best.signal_sec),
-        None,
-        None,
-        best.signal_sec >= crate::rh_spread::SIGNAL_HOLD.as_secs(),
-        (best.signal_sec < crate::rh_spread::SIGNAL_HOLD.as_secs())
+        entry_pct: leg.quote.entry_pct,
+        net_pct: net,
+        held_sec: Some(best.signal_sec),
+        min_net_pct: None,
+        mode: None,
+        openable: best.signal_sec >= crate::rh_spread::SIGNAL_HOLD.as_secs(),
+        block: (best.signal_sec < crate::rh_spread::SIGNAL_HOLD.as_secs())
             .then_some("监控信号保持时间还没到提醒门槛"),
-    );
+    });
     if remember_auto(&row) {
         append(path, &[row]);
     }
@@ -798,23 +797,23 @@ fn manual_row(
     let price_net_pct = (opportunity.spread_net * Decimal::ONE_HUNDRED).round_dp(4);
     let funding_pct = funding_8h_pct(opportunity);
     let net_pct = price_net_pct;
-    let mut value = row(
+    let mut value = row(RowInput {
         at,
-        "manual",
-        &opportunity.symbol.base,
-        &opportunity.symbol.quote,
-        opportunity.long,
-        opportunity.short,
+        kind: "manual",
+        base: &opportunity.symbol.base,
+        quote: &opportunity.symbol.quote,
+        long: opportunity.long,
+        short: opportunity.short,
         entry_pct,
         net_pct,
-        None,
-        None,
-        None,
-        !opportunity.oi_capped,
-        opportunity
+        held_sec: None,
+        min_net_pct: None,
+        mode: None,
+        openable: !opportunity.oi_capped,
+        block: opportunity
             .oi_capped
             .then_some("持仓量已到上限，现在开不出来"),
-    );
+    });
     value["price_net_pct"] = json!(price_net_pct.normalize().to_string());
     value["funding_pct"] = funding_pct.map_or(Value::Null, |funding| {
         json!(funding.normalize().to_string())
@@ -835,11 +834,9 @@ fn manual_row(
     });
     value["min_net_pct"] = json!(min_net.normalize().to_string());
     value["precheck_min_net_pct"] = json!(precheck_min.normalize().to_string());
-    value["net_plus_funding_min_pct"] =
-        json!(net_plus_funding_min_pct().normalize().to_string());
+    value["net_plus_funding_min_pct"] = json!(net_plus_funding_min_pct().normalize().to_string());
     if let (Some(net), Some(funding)) = (net, funding) {
-        value["net_plus_funding_pct"] =
-            json!((net + funding).round_dp(4).normalize().to_string());
+        value["net_plus_funding_pct"] = json!((net + funding).round_dp(4).normalize().to_string());
     }
     if let Some(net) = net {
         let size = copied_settings().size_usdt;
@@ -902,7 +899,7 @@ fn remember_entered(path: &Path, at: DateTime<Utc>, entered: &[&Opportunity]) {
         return;
     }
     let file = path;
-    let mut seen = match recent_minutes(&file, minute) {
+    let mut seen = match recent_minutes(file, minute) {
         Ok(seen) => seen,
         Err(error) => {
             warn!(path = %file.display(), "正常基差样本读不了，这一轮照样追加：{error}");
@@ -919,14 +916,13 @@ fn remember_entered(path: &Path, at: DateTime<Utc>, entered: &[&Opportunity]) {
         ))
     });
     if !fresh.is_empty() {
-        append_basis(&file, &fresh);
+        append_basis(file, &fresh);
     }
 }
 
-fn recent_minutes(
-    path: &Path,
-    minute: i64,
-) -> std::io::Result<HashSet<(i64, String, String, String, Session)>> {
+type BasisMinute = (i64, String, String, String, Session);
+
+fn recent_minutes(path: &Path, minute: i64) -> std::io::Result<HashSet<BasisMinute>> {
     let samples = load_basis(path)?;
     Ok(samples
         .into_iter()
@@ -1242,25 +1238,25 @@ fn auto_row(
 ) -> Option<Value> {
     let candidate = rh_auto::candidate_of_with(line, settings, report)?;
     let held_enough = held_sec >= settings.hold_sec;
-    let listed = settings.symbols.is_empty() || settings.symbols.contains(&candidate.base);
-    Some(row(
+    let listed = !settings.symbols.iter().any(|s| s == &candidate.base);
+    Some(row(RowInput {
         at,
-        "auto",
-        &candidate.base,
-        "USDT",
-        candidate.long,
-        candidate.short,
-        candidate.entry_pct,
-        candidate.net_to_normal_pct,
-        Some(held_sec),
-        Some(settings.min_net_pct),
-        mode.map(|mode| match mode {
+        kind: "auto",
+        base: &candidate.base,
+        quote: "USDT",
+        long: candidate.long,
+        short: candidate.short,
+        entry_pct: candidate.entry_pct,
+        net_pct: candidate.net_to_normal_pct,
+        held_sec: Some(held_sec),
+        min_net_pct: Some(settings.min_net_pct),
+        mode: mode.map(|mode| match mode {
             Mode::Paper => "paper",
             Mode::Live => "live",
         }),
-        held_enough && listed,
-        auto_block(held_enough, listed, &candidate, line),
-    ))
+        openable: held_enough && listed,
+        block: auto_block(held_enough, listed, &candidate, line),
+    }))
 }
 
 fn auto_block(
@@ -1270,7 +1266,7 @@ fn auto_block(
     line: &Line,
 ) -> Option<&'static str> {
     if !listed {
-        return Some("不在自动交易的合约名单里");
+        return Some("在自动交易的排除合约里");
     }
     if !held_enough {
         return Some("信号保持时间还没到门槛");
@@ -1282,35 +1278,37 @@ fn auto_block(
     None
 }
 
-fn row(
+struct RowInput<'a> {
     at: DateTime<Utc>,
-    kind: &str,
-    base: &str,
-    quote: &str,
+    kind: &'a str,
+    base: &'a str,
+    quote: &'a str,
     long: Venue,
     short: Venue,
     entry_pct: Decimal,
     net_pct: Decimal,
     held_sec: Option<u64>,
     min_net_pct: Option<Decimal>,
-    mode: Option<&str>,
+    mode: Option<&'a str>,
     openable: bool,
-    block: Option<&str>,
-) -> Value {
+    block: Option<&'a str>,
+}
+
+fn row(input: RowInput<'_>) -> Value {
     json!({
-        "at": at.to_rfc3339_opts(SecondsFormat::Secs, true),
-        "kind": kind,
-        "base": base,
-        "quote": quote,
-        "long": long.as_str(),
-        "short": short.as_str(),
-        "entry_pct": entry_pct.normalize().to_string(),
-        "net_pct": net_pct.normalize().to_string(),
-        "held_sec": held_sec,
-        "min_net_pct": min_net_pct.map(|value| value.normalize().to_string()),
-        "mode": mode,
-        "openable": openable,
-        "block": block,
+        "at": input.at.to_rfc3339_opts(SecondsFormat::Secs, true),
+        "kind": input.kind,
+        "base": input.base,
+        "quote": input.quote,
+        "long": input.long.as_str(),
+        "short": input.short.as_str(),
+        "entry_pct": input.entry_pct.normalize().to_string(),
+        "net_pct": input.net_pct.normalize().to_string(),
+        "held_sec": input.held_sec,
+        "min_net_pct": input.min_net_pct.map(|value| value.normalize().to_string()),
+        "mode": input.mode,
+        "openable": input.openable,
+        "block": input.block,
     })
 }
 
@@ -1345,14 +1343,6 @@ fn write(path: &Path, rows: &[Value]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// 给测试看的一行。正式记录不读这个文件。
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct Logged {
-    kind: String,
-    openable: bool,
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1364,18 +1354,23 @@ mod tests {
             "arcus",
             dec!(300),
             dec!(3),
-            dec!(0.184),
-            dec!(-0.072),
-            dec!(0.222),
-            "周末",
-            dec!(0.08),
-            dec!(0.047),
+            &super::ManualSpread {
+                entry_pct: dec!(0.184),
+                normal_basis_pct: dec!(-0.072),
+                basis_pct: dec!(0.222),
+                session_label: "周末".into(),
+                net_to_normal_pct: dec!(0.08),
+                funding_pct: dec!(0.047),
+            },
         );
         assert!(
             text.contains("可成交价差 0.184%（300 USDT），周末正常基差 -0.072%，当前 0.222%（Arcus − Lighter RH）"),
             "{text}"
         );
-        assert!(text.contains("回到正常净利润 0.08%（不含资金费，已扣手续费与平仓穿价）"), "{text}");
+        assert!(
+            text.contains("回到正常净利润 0.08%（不含资金费，已扣手续费与平仓穿价）"),
+            "{text}"
+        );
         assert!(
             text.contains("回到正常净利润 + 8 小时资金费 0.127%（资金费 0.047%，≈0.38 USDT）"),
             "{text}"
@@ -1588,7 +1583,8 @@ mod tests {
 
     #[test]
     fn a_missing_file_is_created_and_failure_does_not_panic() {
-        let dir = std::env::temp_dir().join(format!("opportunity-log-test-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir()
+            .join(format!("opportunity-log-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("gone").join("opportunities.jsonl");
         append(&path, &[json!({"kind": "manual", "openable": true})]);
@@ -1623,9 +1619,10 @@ mod tests {
 
     #[test]
     fn manual_flow_continues_when_the_opportunity_file_is_off() {
-        let dir = std::env::temp_dir().join(format!("opportunity-memory-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir()
+            .join(format!("opportunity-memory-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let basis = dir.join("opportunity-log-basis.jsonl");
+        let basis = dir.join("opportunity-log-basis-flow.jsonl");
         let session = session_of();
         let now = Utc::now().timestamp() / 60 * 60;
         let seeded: Vec<BasisSample> = (0..MIN_MINUTES as i64)
@@ -1714,10 +1711,10 @@ mod tests {
 
     #[test]
     fn basis_file_drops_samples_older_than_seven_days() {
-        let dir =
-            std::env::temp_dir().join(format!("opportunity-basis-test-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir()
+            .join(format!("opportunity-basis-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let basis = basis_path(&dir.join("opportunity-log.jsonl"));
+        let basis = basis_path(&dir.join("opportunity-log-age.jsonl"));
         let old = BasisSample {
             t: Utc::now().timestamp() - 8 * 24 * 3600,
             base: "OLD".into(),
@@ -1748,10 +1745,10 @@ mod tests {
 
     #[test]
     fn basis_samples_only_pairs_that_enter_the_manual_file() {
-        let dir =
-            std::env::temp_dir().join(format!("opportunity-basis-filter-{}", std::process::id()));
+        let dir = crate::test_scratch::scratch_dir()
+            .join(format!("opportunity-basis-filter-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("opportunity-log.jsonl");
+        let path = dir.join("opportunity-log-filter.jsonl");
         let basis = basis_path(&path);
         let session = session_of();
         let now = Utc::now().timestamp() / 60 * 60;

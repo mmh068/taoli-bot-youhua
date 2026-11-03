@@ -82,9 +82,11 @@ fn base_builder(timeout_sec: u64) -> ClientBuilder {
             "ARB_USER_AGENT 含控制字符、非 ASCII 或超过 128 字符，已改用 {DEFAULT_USER_AGENT}"
         );
     }
-    let agent = valid_user_agent(&agent)
-        .then_some(agent)
-        .unwrap_or_else(|| DEFAULT_USER_AGENT.to_string());
+    let agent = if valid_user_agent(&agent) {
+        agent
+    } else {
+        DEFAULT_USER_AGENT.to_string()
+    };
     Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_sec))
         .user_agent(agent)

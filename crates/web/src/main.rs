@@ -41,6 +41,8 @@ mod shutdown;
 mod stats;
 mod strategy;
 mod telegram;
+#[cfg(test)]
+mod test_scratch;
 mod trade;
 
 use cache::{ScanCache, spawn_refresher};
@@ -232,17 +234,19 @@ async fn main() -> anyhow::Result<()> {
                     key.short.as_str()
                 );
                 let now = Instant::now();
-                if let Ok(seen) = sent.lock() {
-                    if seen
+                if let Ok(seen) = sent.lock()
+                    && seen
                         .get(&dedupe)
                         .is_some_and(|at| now.duration_since(*at) < Duration::from_secs(30 * 60))
-                    {
-                        continue;
-                    }
+                {
+                    continue;
                 }
-                let code = issue_manual_code(&state, base, key.long, key.short);
+                // 先确认推送数据还在，再发代码。否则代码会白占 30 分钟。
                 let Some(spread) = opportunity_log::spread_for_push(base, key.long, key.short)
                 else {
+                    continue;
+                };
+                let Ok(code) = issue_manual_code(&state, base, key.long, key.short) else {
                     continue;
                 };
                 let text = opportunity_log::manual_push_text(
@@ -251,12 +255,7 @@ async fn main() -> anyhow::Result<()> {
                     key.short.as_str(),
                     key.size,
                     key.leverage,
-                    spread.entry_pct,
-                    spread.normal_basis_pct,
-                    spread.basis_pct,
-                    &spread.session_label,
-                    spread.net_to_normal_pct,
-                    spread.funding_pct,
+                    &spread,
                 );
                 let telegram_sent = telegram::push_open_button(&text, &code).await;
                 let discord_sent = state.alerts.notify_discord(text);
@@ -795,26 +794,47 @@ async fn manual_open_signal(
     }
 }
 
-fn issue_manual_code(state: &AppState, base: &str, long: Venue, short: Venue) -> String {
-    let ticks = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let code = format!("M{:08x}", (ticks as u64) ^ (ticks >> 32) as u64);
-    if let Ok(mut guard) = state.manual_signal.lock() {
-        let now = std::time::Instant::now();
-        guard.retain(|_, (_, _, _, until)| *until > now);
-        guard.insert(
-            code.clone(),
-            (
-                base.trim().to_ascii_uppercase(),
-                long,
-                short,
-                now + std::time::Duration::from_secs(30 * 60),
-            ),
+fn issue_manual_code(
+    state: &AppState,
+    base: &str,
+    long: Venue,
+    short: Venue,
+) -> Result<String, String> {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes).map_err(|error| format!("系统随机数不可用：{error}"))?;
+    let mut code = format!(
+        "M{}",
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    );
+    let mut guard = state
+        .manual_signal
+        .lock()
+        .map_err(|_| "开仓代码暂时写不了".to_string())?;
+    if guard.contains_key(&code) {
+        getrandom::getrandom(&mut bytes).map_err(|error| format!("系统随机数不可用：{error}"))?;
+        code = format!(
+            "M{}",
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
         );
     }
-    code
+    let now = std::time::Instant::now();
+    guard.retain(|_, (_, _, _, until)| *until > now);
+    guard.insert(
+        code.clone(),
+        (
+            base.trim().to_ascii_uppercase(),
+            long,
+            short,
+            now + std::time::Duration::from_secs(30 * 60),
+        ),
+    );
+    Ok(code)
 }
 
 fn manual_still_qualifying(base: &str, long: Venue, short: Venue) -> bool {

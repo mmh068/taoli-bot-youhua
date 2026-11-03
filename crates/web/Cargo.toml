@@ -24,6 +24,8 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
+# 手动开仓代码用系统随机数，避免用时间戳拼出来、可以被猜到。
+getrandom = "0.2"
 # 响应压缩：/api/scan 一次 13 MB、app.js 120 KB，不压缩的话远程访问很慢。
 # 价差监控的行情 WebSocket（Lighter RH / Arcus）。只用 rustls + ring，与 reqwest 同一套 TLS。
 tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
@@ -32,3 +34,4 @@ tower-http = { version = "0.6", default-features = false, features = ["compressi
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }
+tempfile = "3"

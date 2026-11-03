@@ -5,7 +5,8 @@ use super::*;
 #[tokio::test]
 #[ignore]
 async fn live_probe() {
-    let dir = std::env::temp_dir().join(format!("rh-spread-probe-{}", std::process::id()));
+    let dir =
+        crate::test_scratch::scratch_dir().join(format!("rh-spread-probe-{}", std::process::id()));
     let config = Config {
         enabled: true,
         size_usdt: Decimal::from(2000),
@@ -96,7 +97,7 @@ fn config() -> Config {
         size_usdt: dec!(1000),
         alert_net_pct: dec!(0.05),
         equities_only: false,
-        dir: std::env::temp_dir(),
+        dir: crate::test_scratch::scratch_dir(),
         pairs: vec![Pair::RH],
         entropy_rebate: Decimal::ZERO,
     }
@@ -425,8 +426,11 @@ fn normal_needs_enough_minutes_in_the_same_session_and_window() {
 
 #[tokio::test]
 async fn history_round_trips_through_daily_files_and_skips_broken_lines() {
-    let dir =
-        std::env::temp_dir().join(format!("rh-spread-test-{}-{}", std::process::id(), line!()));
+    let dir = crate::test_scratch::scratch_dir().join(format!(
+        "rh-spread-test-{}-{}",
+        std::process::id(),
+        line!()
+    ));
     let now = Utc.with_ymd_and_hms(2026, 10, 7, 12, 0, 0).unwrap();
     let rows: Vec<Row> = (0..3)
         .map(|i| Row {

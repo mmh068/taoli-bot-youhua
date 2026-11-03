@@ -380,7 +380,7 @@ mod tests {
         );
         replayed.positions.insert(fresh.id.clone(), fresh);
         replayed.positions.insert(stale.id.clone(), stale);
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::scratch_dir().join(format!(
             "window-test-{}-{}.jsonl",
             std::process::id(),
             Utc::now().timestamp_nanos_opt().unwrap_or(0)

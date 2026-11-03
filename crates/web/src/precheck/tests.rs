@@ -610,7 +610,8 @@ async fn unchecked_rows_come_before_rechecks() {
 
 #[test]
 fn recently_used_parameters_are_remembered_across_restarts() {
-    let dir = std::env::temp_dir().join(format!("arb-precheck-{}", std::process::id()));
+    let dir =
+        crate::test_scratch::scratch_dir().join(format!("arb-precheck-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("watches.json");
     let _ = std::fs::remove_file(&path);

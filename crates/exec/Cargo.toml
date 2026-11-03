@@ -40,3 +40,4 @@ base64 = "0.22"
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }
+tempfile = "3"

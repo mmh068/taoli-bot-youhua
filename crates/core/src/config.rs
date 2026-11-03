@@ -152,6 +152,14 @@ impl Settings {
         if self.scan_interval_sec == 0 {
             return Err(ArbError::config("ARB_SCAN_INTERVAL_SEC 必须大于 0"));
         }
+        if self.http_port == 0 {
+            return Err(ArbError::config("ARB_HTTP_PORT 不能为 0"));
+        }
+        if !self.max_daily_loss_usdt.is_finite() || self.max_daily_loss_usdt <= 0.0 {
+            return Err(ArbError::config(
+                "ARB_MAX_DAILY_LOSS_USDT 必须是大于 0 的有限数字",
+            ));
+        }
         if self.spread_hold_days <= Decimal::ZERO
             || self.spread_hold_days > Decimal::from(MAX_AMORTIZE_DAYS)
         {
@@ -406,6 +414,20 @@ mod tests {
 
         // 关闭门槛必须合法 —— 那是「我自己看，不要你替我挡」的显式选择
         base.max_entry_basis_pct = None;
+        assert!(base.validate().is_ok());
+    }
+
+    #[test]
+    fn daily_loss_must_be_positive_and_the_port_cannot_be_zero() {
+        let mut base = settings(Decimal::new(5, 4), Decimal::from(7u32), 2);
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            base.max_daily_loss_usdt = bad;
+            assert!(base.validate().is_err(), "{bad}");
+        }
+        base.max_daily_loss_usdt = 100.0;
+        base.http_port = 0;
+        assert!(base.validate().is_err(), "端口 0 不能监听");
+        base.http_port = 8080;
         assert!(base.validate().is_ok());
     }
 

@@ -2668,8 +2668,8 @@ mod tests {
             .await
             .unwrap();
         let address = board["entries"][2]["address"].as_str().unwrap().to_string();
-        let journal_path =
-            std::env::temp_dir().join(format!("arcus-smoke-{}.jsonl", now_ns().unwrap()));
+        let journal_path = crate::test_scratch::scratch_dir()
+            .join(format!("arcus-smoke-{}.jsonl", now_ns().unwrap()));
         let mut broker = ArcusBroker {
             client: client.clone(),
             base_url: BASE_URL.to_string(),
@@ -3188,7 +3188,7 @@ mod tests {
     /// 子账户 3、RFC 8032 测试私钥、市场列表里有 LIT(41) 与 BTC(1)；不联网。
     fn margin_broker(base_url: &str, trading_enabled: bool) -> (ArcusBroker, TempJournal) {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
-        let path = std::env::temp_dir().join(format!(
+        let path = crate::test_scratch::scratch_dir().join(format!(
             "arcus-margin-{}-{}.jsonl",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::SeqCst)

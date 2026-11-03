@@ -176,7 +176,8 @@ mod tests {
 
     #[test]
     fn the_switch_survives_a_restart_and_an_unreadable_file_means_paused() {
-        let dir = std::env::temp_dir().join(format!("arb-pause-{}", std::process::id()));
+        let dir =
+            crate::test_scratch::scratch_dir().join(format!("arb-pause-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = path_for(&dir.join("ledger.jsonl"));
         let _ = std::fs::remove_file(&path);
